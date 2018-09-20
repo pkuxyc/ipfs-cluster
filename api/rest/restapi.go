@@ -23,6 +23,8 @@ import (
 
 	"github.com/ipfs/ipfs-cluster/adder/adderutils"
 	types "github.com/ipfs/ipfs-cluster/api"
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/plugin/ochttp/propagation/tracecontext"
 	"go.opencensus.io/trace"
 
 	mux "github.com/gorilla/mux"
@@ -115,7 +117,10 @@ func NewAPIWithHost(ctx context.Context, cfg *Config, h host.Host) (*API, error)
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
-		Handler:           router,
+		Handler: &ochttp.Handler{
+			Handler:     router,
+			Propagation: &tracecontext.HTTPFormat{},
+		},
 	}
 
 	// See: https://github.com/ipfs/go-ipfs/issues/5168
@@ -485,34 +490,52 @@ func (api *API) SetClient(c *rpc.Client) {
 }
 
 func (api *API) idHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/idHandler")
+	defer span.End()
+
 	idSerial := types.IDSerial{}
-	err := api.rpcClient.Call("",
+	err := api.rpcClient.CallContext(
+		ctx,
+		"",
 		"Cluster",
 		"ID",
 		struct{}{},
-		&idSerial)
+		&idSerial,
+	)
 
 	api.sendResponse(w, autoStatus, err, idSerial)
 }
 
 func (api *API) versionHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/versionHandler")
+	defer span.End()
+
 	var v types.Version
-	err := api.rpcClient.Call("",
+	err := api.rpcClient.CallContext(
+		ctx,
+		"",
 		"Cluster",
 		"Version",
 		struct{}{},
-		&v)
+		&v,
+	)
 
 	api.sendResponse(w, autoStatus, err, v)
 }
 
 func (api *API) graphHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/graphHandler")
+	defer span.End()
+
 	var graph types.ConnectGraphSerial
-	err := api.rpcClient.Call("",
+	err := api.rpcClient.CallContext(
+		ctx,
+		"",
 		"Cluster",
 		"ConnectGraph",
 		struct{}{},
-		&graph)
+		&graph,
+	)
 	api.sendResponse(w, autoStatus, err, graph)
 }
 
@@ -525,11 +548,15 @@ func (api *API) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		"Cluster",
 		"PeerMonitorLatestMetrics",
 		name,
-		&metrics)
+		&metrics,
+	)
 	api.sendResponse(w, autoStatus, err, metrics)
 }
 
 func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/addHandler")
+	defer span.End()
+
 	reader, err := r.MultipartReader()
 	if err != nil {
 		api.sendResponse(w, http.StatusBadRequest, err, nil)
@@ -558,17 +585,26 @@ func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) peerListHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/peerListHandler")
+	defer span.End()
+
 	var peersSerial []types.IDSerial
-	err := api.rpcClient.Call("",
+	err := api.rpcClient.CallContext(
+		ctx,
+		"",
 		"Cluster",
 		"Peers",
 		struct{}{},
-		&peersSerial)
+		&peersSerial,
+	)
 
 	api.sendResponse(w, autoStatus, err, peersSerial)
 }
 
 func (api *API) peerAddHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/peerAddHandler")
+	defer span.End()
+
 	dec := json.NewDecoder(r.Body)
 	defer r.Body.Close()
 
@@ -586,11 +622,14 @@ func (api *API) peerAddHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var ids types.IDSerial
-	err = api.rpcClient.Call("",
+	err = api.rpcClient.CallContext(
+		ctx,
+		"",
 		"Cluster",
 		"PeerAdd",
 		addInfo.PeerID,
-		&ids)
+		&ids,
+	)
 	api.sendResponse(w, autoStatus, err, ids)
 }
 
@@ -606,12 +645,12 @@ func (api *API) peerRemoveHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) pinHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := trace.StartSpan(api.ctx, "pinHandler")
+	ctx, span := startHandlerSpan(r, "rest/api/pinHandler")
 	defer span.End()
 
 	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
 		logger.Debugf("rest api pinHandler: %s", ps.Cid)
-
+		span.AddAttributes(trace.StringAttribute("cid", ps.Cid))
 		err := api.rpcClient.CallContext(
 			ctx,
 			"",
@@ -626,11 +665,12 @@ func (api *API) pinHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) unpinHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := trace.StartSpan(api.ctx, "unpinHandler")
+	ctx, span := startHandlerSpan(r, "rest/api/unpinHandler")
 	defer span.End()
 
 	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
 		logger.Debugf("rest api unpinHandler: %s", ps.Cid)
+		span.AddAttributes(trace.StringAttribute("cid", ps.Cid))
 		err := api.rpcClient.CallContext(
 			ctx,
 			"",
@@ -645,6 +685,9 @@ func (api *API) unpinHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) allocationsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/allocationsHandler")
+	defer span.End()
+
 	queryValues := r.URL.Query()
 	filterStr := queryValues.Get("filter")
 	var filter types.PinType
@@ -652,7 +695,8 @@ func (api *API) allocationsHandler(w http.ResponseWriter, r *http.Request) {
 		filter |= types.PinTypeFromString(f)
 	}
 	var pins []types.PinSerial
-	err := api.rpcClient.Call(
+	err := api.rpcClient.CallContext(
+		ctx,
 		"",
 		"Cluster",
 		"Pins",
@@ -670,13 +714,19 @@ func (api *API) allocationsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) allocationHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/allocationHandler")
+	defer span.End()
+
 	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
 		var pin types.PinSerial
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			ctx,
+			"",
 			"Cluster",
 			"PinGet",
 			ps,
-			&pin)
+			&pin,
+		)
 		if err != nil { // errors here are 404s
 			api.sendResponse(w, http.StatusNotFound, err, nil)
 			return
@@ -686,7 +736,7 @@ func (api *API) allocationHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := trace.StartSpan(api.ctx, "statusAllHandler")
+	ctx, span := startHandlerSpan(r, "rest/api/statusAllHandler")
 	defer span.End()
 
 	queryValues := r.URL.Query()
@@ -718,7 +768,7 @@ func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) statusHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, span := trace.StartSpan(api.ctx, "statusHandler")
+	ctx, span := startHandlerSpan(r, "rest/api/statusHandler")
 	defer span.End()
 
 	queryValues := r.URL.Query()
@@ -749,63 +799,87 @@ func (api *API) statusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) syncAllHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/syncAllHandler")
+	defer span.End()
+
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
 	if local == "true" {
 		var pinInfos []types.PinInfoSerial
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			ctx,
+			"",
 			"Cluster",
 			"SyncAllLocal",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfosToGlobal(pinInfos))
 	} else {
 		var pinInfos []types.GlobalPinInfoSerial
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			ctx,
+			"",
 			"Cluster",
 			"SyncAll",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfos)
 	}
 }
 
 func (api *API) syncHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/syncHandler")
+	defer span.End()
+
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
 	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
 		if local == "true" {
 			var pinInfo types.PinInfoSerial
-			err := api.rpcClient.Call("",
+			err := api.rpcClient.CallContext(
+				ctx,
+				"",
 				"Cluster",
 				"SyncLocal",
 				ps,
-				&pinInfo)
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(pinInfo))
 		} else {
 			var pinInfo types.GlobalPinInfoSerial
-			err := api.rpcClient.Call("",
+			err := api.rpcClient.CallContext(
+				ctx,
+				"",
 				"Cluster",
 				"Sync",
 				ps,
-				&pinInfo)
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfo)
 		}
 	}
 }
 
 func (api *API) recoverAllHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/recoverAllHandler")
+	defer span.End()
+
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 	if local == "true" {
 		var pinInfos []types.PinInfoSerial
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			ctx,
+			"",
 			"Cluster",
 			"RecoverAllLocal",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfosToGlobal(pinInfos))
 	} else {
 		api.sendResponse(w, http.StatusBadRequest, errors.New("only requests with parameter local=true are supported"), nil)
@@ -813,25 +887,34 @@ func (api *API) recoverAllHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) recoverHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, span := startHandlerSpan(r, "rest/api/recoverHandler")
+	defer span.End()
+
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
 	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
 		if local == "true" {
 			var pinInfo types.PinInfoSerial
-			err := api.rpcClient.Call("",
+			err := api.rpcClient.CallContext(
+				ctx,
+				"",
 				"Cluster",
 				"RecoverLocal",
 				ps,
-				&pinInfo)
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(pinInfo))
 		} else {
 			var pinInfo types.GlobalPinInfoSerial
-			err := api.rpcClient.Call("",
+			err := api.rpcClient.CallContext(
+				ctx,
+				"",
 				"Cluster",
 				"Recover",
 				ps,
-				&pinInfo)
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfo)
 		}
 	}
@@ -976,4 +1059,10 @@ func (api *API) setHeaders(w http.ResponseWriter) {
 	}
 
 	w.Header().Add("Content-Type", "application/json")
+}
+
+func startHandlerSpan(r *http.Request, name string) (context.Context, *trace.Span) {
+	ctx, span := trace.StartSpan(r.Context(), name, trace.WithSpanKind(trace.SpanKindServer))
+	span.AddAttributes(trace.StringAttribute("client-ip", r.RemoteAddr))
+	return ctx, span
 }

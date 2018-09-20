@@ -30,8 +30,9 @@ const (
 )
 
 func testAPI(t *testing.T) *API {
+	ctx := context.Background()
 	apiMAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
-	h, err := libp2p.New(context.Background(), libp2p.ListenAddrs(apiMAddr))
+	h, err := libp2p.New(ctx, libp2p.ListenAddrs(apiMAddr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +41,7 @@ func testAPI(t *testing.T) *API {
 	cfg.Default()
 	cfg.HTTPListenAddr = apiMAddr
 
-	rest, err := NewAPIWithHost(cfg, h)
+	rest, err := NewAPIWithHost(ctx, cfg, h)
 	if err != nil {
 		t.Fatal("should be able to create a new Api: ", err)
 	}
@@ -53,8 +54,9 @@ func testAPI(t *testing.T) *API {
 }
 
 func testHTTPSAPI(t *testing.T) *API {
+	ctx := context.Background()
 	apiMAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
-	h, err := libp2p.New(context.Background(), libp2p.ListenAddrs(apiMAddr))
+	h, err := libp2p.New(ctx, libp2p.ListenAddrs(apiMAddr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +71,7 @@ func testHTTPSAPI(t *testing.T) *API {
 	}
 	cfg.HTTPListenAddr = apiMAddr
 
-	rest, err := NewAPIWithHost(cfg, h)
+	rest, err := NewAPIWithHost(ctx, cfg, h)
 	if err != nil {
 		t.Fatal("should be able to create a new https Api: ", err)
 	}

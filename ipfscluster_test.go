@@ -122,6 +122,7 @@ func randomBytes() []byte {
 }
 
 func createComponents(t *testing.T, i int, clusterSecret []byte, staging bool) (host.Host, *Config, *raft.Consensus, API, IPFSConnector, state.State, PinTracker, PeerMonitor, PinAllocator, Informer, *test.IpfsMock) {
+	ctx := context.Background()
 	mock := test.NewIpfsMock()
 	//
 	//clusterAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", clusterPort+i))
@@ -158,7 +159,7 @@ func createComponents(t *testing.T, i int, clusterSecret []byte, staging bool) (
 	ipfshttpCfg.NodeAddr = nodeAddr
 	consensusCfg.DataFolder = "./e2eTestRaft/" + pid.Pretty()
 
-	api, err := rest.NewAPI(apiCfg)
+	api, err := rest.NewAPI(ctx, apiCfg)
 	checkErr(t, err)
 	ipfs, err := ipfshttp.NewConnector(ipfshttpCfg)
 	checkErr(t, err)
@@ -430,6 +431,7 @@ func TestClustersPeers(t *testing.T) {
 }
 
 func TestClustersPin(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	exampleCid, _ := cid.Decode(test.TestCid1)
@@ -441,19 +443,19 @@ func TestClustersPin(t *testing.T) {
 		j := rand.Intn(nClusters)           // choose a random cluster peer
 		h, err := prefix.Sum(randomBytes()) // create random cid
 		checkErr(t, err)
-		err = clusters[j].Pin(api.PinCid(h))
+		err = clusters[j].Pin(ctx, api.PinCid(h))
 		if err != nil {
 			t.Errorf("error pinning %s: %s", h, err)
 		}
 		// Test re-pin
-		err = clusters[j].Pin(api.PinCid(h))
+		err = clusters[j].Pin(ctx, api.PinCid(h))
 		if err != nil {
 			t.Errorf("error repinning %s: %s", h, err)
 		}
 	}
 	delay()
 	fpinned := func(t *testing.T, c *Cluster) {
-		status := c.tracker.StatusAll()
+		status := c.tracker.StatusAll(ctx)
 		for _, v := range status {
 			if v.Status != api.TrackerStatusPinned {
 				t.Errorf("%s should have been pinned but it is %s", v.Cid, v.Status)
@@ -471,7 +473,7 @@ func TestClustersPin(t *testing.T) {
 	for i := 0; i < len(pinList); i++ {
 		// test re-unpin fails
 		j := rand.Intn(nClusters) // choose a random cluster peer
-		err := clusters[j].Unpin(pinList[i].Cid)
+		err := clusters[j].Unpin(ctx, pinList[i].Cid)
 		if err != nil {
 			t.Errorf("error unpinning %s: %s", pinList[i].Cid, err)
 		}
@@ -479,7 +481,7 @@ func TestClustersPin(t *testing.T) {
 	delay()
 	for i := 0; i < nPins; i++ {
 		j := rand.Intn(nClusters) // choose a random cluster peer
-		err := clusters[j].Unpin(pinList[i].Cid)
+		err := clusters[j].Unpin(ctx, pinList[i].Cid)
 		if err == nil {
 			t.Errorf("expected error re-unpinning %s: %s", pinList[i].Cid, err)
 		}
@@ -487,7 +489,7 @@ func TestClustersPin(t *testing.T) {
 
 	delay()
 	funpinned := func(t *testing.T, c *Cluster) {
-		status := c.tracker.StatusAll()
+		status := c.tracker.StatusAll(ctx)
 		for _, v := range status {
 			t.Errorf("%s should have been unpinned but it is %s", v.Cid, v.Status)
 		}
@@ -496,10 +498,11 @@ func TestClustersPin(t *testing.T) {
 }
 
 func TestClustersStatusAll(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 	// Global status
 	f := func(t *testing.T, c *Cluster) {
@@ -540,10 +543,11 @@ func TestClustersStatusAll(t *testing.T) {
 }
 
 func TestClustersStatusAllWithErrors(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 
 	// shutdown 1 cluster peer
@@ -600,12 +604,13 @@ func TestClustersStatusAllWithErrors(t *testing.T) {
 }
 
 func TestClustersSyncAllLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
 	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
@@ -630,12 +635,13 @@ func TestClustersSyncAllLocal(t *testing.T) {
 }
 
 func TestClustersSyncLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
 	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
@@ -662,12 +668,13 @@ func TestClustersSyncLocal(t *testing.T) {
 }
 
 func TestClustersSyncAll(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
 	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
@@ -694,12 +701,13 @@ func TestClustersSyncAll(t *testing.T) {
 }
 
 func TestClustersSync(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
 	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
@@ -756,6 +764,7 @@ func TestClustersSync(t *testing.T) {
 }
 
 func TestClustersRecoverLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
@@ -763,8 +772,8 @@ func TestClustersRecoverLocal(t *testing.T) {
 
 	ttlDelay()
 
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
@@ -795,6 +804,7 @@ func TestClustersRecoverLocal(t *testing.T) {
 }
 
 func TestClustersRecover(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
@@ -802,8 +812,8 @@ func TestClustersRecover(t *testing.T) {
 
 	ttlDelay()
 
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 
 	pinDelay()
 	pinDelay()
@@ -882,6 +892,7 @@ func TestClustersShutdown(t *testing.T) {
 }
 
 func TestClustersReplication(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -905,7 +916,7 @@ func TestClustersReplication(t *testing.T) {
 		j := rand.Intn(nClusters)           // choose a random cluster peer
 		h, err := prefix.Sum(randomBytes()) // create random cid
 		checkErr(t, err)
-		err = clusters[j].Pin(api.PinCid(h))
+		err = clusters[j].Pin(ctx, api.PinCid(h))
 		if err != nil {
 			t.Error(err)
 		}
@@ -938,7 +949,7 @@ func TestClustersReplication(t *testing.T) {
 	}
 
 	f := func(t *testing.T, c *Cluster) {
-		pinfos := c.tracker.StatusAll()
+		pinfos := c.tracker.StatusAll(ctx)
 		if len(pinfos) != nClusters {
 			t.Error("Pinfos does not have the expected pins")
 		}
@@ -970,7 +981,7 @@ func TestClustersReplication(t *testing.T) {
 			}
 			for _, a := range allocs {
 				if a == c.id {
-					pinfo := c.tracker.Status(pin.Cid)
+					pinfo := c.tracker.Status(ctx, pin.Cid)
 					if pinfo.Status != api.TrackerStatusPinned {
 						t.Errorf("Peer %s was allocated but it is not pinning cid", c.id)
 					}
@@ -985,6 +996,7 @@ func TestClustersReplication(t *testing.T) {
 // This test checks that we pin with ReplicationFactorMax when
 // we can
 func TestClustersReplicationFactorMax(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 3 {
 		t.Skip("Need at least 3 peers")
 	}
@@ -999,7 +1011,7 @@ func TestClustersReplicationFactorMax(t *testing.T) {
 	ttlDelay()
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1030,6 +1042,7 @@ func TestClustersReplicationFactorMax(t *testing.T) {
 // This tests checks that repinning something that is overpinned
 // removes some allocations
 func TestClustersReplicationFactorMaxLower(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1044,7 +1057,7 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 	ttlDelay() // make sure we have places to pin
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,7 +1076,7 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 	pin := api.PinCid(h)
 	pin.ReplicationFactorMin = 1
 	pin.ReplicationFactorMax = 2
-	err = clusters[0].Pin(pin)
+	err = clusters[0].Pin(ctx, pin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,6 +1096,7 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 // This test checks that when not all nodes are available,
 // we pin in as many as we can aiming for ReplicationFactorMax
 func TestClustersReplicationFactorInBetween(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1103,7 +1117,7 @@ func TestClustersReplicationFactorInBetween(t *testing.T) {
 	waitForLeaderAndMetrics(t, clusters)
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1137,6 +1151,7 @@ func TestClustersReplicationFactorInBetween(t *testing.T) {
 // This test checks that we do not pin something for which
 // we cannot reach ReplicationFactorMin
 func TestClustersReplicationFactorMin(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1155,7 +1170,7 @@ func TestClustersReplicationFactorMin(t *testing.T) {
 	waitForLeaderAndMetrics(t, clusters)
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err == nil {
 		t.Error("Pin should have failed as rplMin cannot be satisfied")
 	}
@@ -1168,6 +1183,7 @@ func TestClustersReplicationFactorMin(t *testing.T) {
 // This tests checks that repinning something that has becomed
 // underpinned actually changes nothing if it's sufficiently pinned
 func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1182,7 +1198,7 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 	ttlDelay()
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1195,7 +1211,7 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 	clusters[nClusters-2].Shutdown()
 	waitForLeaderAndMetrics(t, clusters)
 
-	err = clusters[0].Pin(api.PinCid(h))
+	err = clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1220,6 +1236,7 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 // underpinned does re-allocations when it's not sufficiently
 // pinned anymore
 func TestClustersReplicationMinMaxRealloc(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1234,7 +1251,7 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 	ttlDelay() // make sure metrics are in
 
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1264,7 +1281,7 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 	waitForLeaderAndMetrics(t, clusters)
 
 	// Repin - (although this might have been taken of if there was an alert
-	err = safePeer.Pin(api.PinCid(h))
+	err = safePeer.Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1303,6 +1320,7 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 // In this test we check that repinning something
 // when a node has gone down will re-assign the pin
 func TestClustersReplicationRealloc(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -1314,7 +1332,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 
 	j := rand.Intn(nClusters)
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1330,7 +1348,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 
 	// Re-pin should work and be allocated to the same
 	// nodes
-	err = clusters[j].Pin(api.PinCid(h))
+	err = clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1351,7 +1369,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	var killedClusterIndex int
 	// find someone that pinned it and kill that cluster
 	for i, c := range clusters {
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Logf("Killing %s", c.id.Pretty())
 			killedClusterIndex = i
@@ -1372,7 +1390,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	}
 
 	// now pin should succeed
-	err = clusters[j].Pin(api.PinCid(h))
+	err = clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1384,7 +1402,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 		if i == killedClusterIndex {
 			continue
 		}
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Log(pinfo.Peer.Pretty())
 			numPinned++
@@ -1400,6 +1418,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 // as many available peers a we need. It's like before, except
 // more peers are killed.
 func TestClustersReplicationNotEnoughPeers(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1412,7 +1431,7 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 
 	j := rand.Intn(nClusters)
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1425,7 +1444,7 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 
 	waitForLeaderAndMetrics(t, clusters)
 
-	err = clusters[2].Pin(api.PinCid(h))
+	err = clusters[2].Pin(ctx, api.PinCid(h))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -1437,6 +1456,7 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 }
 
 func TestClustersRebalanceOnPeerDown(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1450,7 +1470,7 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 
 	// pin something
 	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 	pinLocal := 0
 	pinRemote := 0
@@ -1488,7 +1508,7 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 	waitForLeaderAndMetrics(t, clusters) // in case we killed the leader
 
 	// It should be now pinned in the remote pinner
-	if s := remotePinnerCluster.tracker.Status(h).Status; s != api.TrackerStatusPinned {
+	if s := remotePinnerCluster.tracker.Status(ctx, h).Status; s != api.TrackerStatusPinned {
 		t.Errorf("it should be pinned and is %s", s)
 	}
 }
@@ -1630,6 +1650,7 @@ func TestClustersGraphUnhealthy(t *testing.T) {
 // Check that the pin is not re-assigned when a node
 // that has disabled repinning goes down.
 func TestClustersDisabledRepinning(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -1642,7 +1663,7 @@ func TestClustersDisabledRepinning(t *testing.T) {
 
 	j := rand.Intn(nClusters)
 	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1653,7 +1674,7 @@ func TestClustersDisabledRepinning(t *testing.T) {
 	var killedClusterIndex int
 	// find someone that pinned it and kill that cluster
 	for i, c := range clusters {
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			killedClusterIndex = i
 			t.Logf("Shutting down %s", c.ID().ID)
@@ -1677,7 +1698,7 @@ func TestClustersDisabledRepinning(t *testing.T) {
 		if i == killedClusterIndex {
 			continue
 		}
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Log(pinfo.Peer.Pretty())
 			numPinned++
