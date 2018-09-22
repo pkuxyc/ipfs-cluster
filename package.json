@@ -56,12 +56,6 @@
       "version": "3.0.4"
     },
     {
-      "author": "ZenGround0",
-      "hash": "QmPuuqyMyoadGDkefg7L11kAwmvQykrHiRkuLjQRpa1bqF",
-      "name": "go-dot",
-      "version": "0.0.1"
-    },
-    {
       "author": "dignifiedquire",
       "hash": "Qmc4w3gm2TqoEbTYjpPs5FXP8DEB6cuvZWPy6bUTKiht7a",
       "name": "go-fs-lock",
@@ -155,6 +149,12 @@
       "hash": "QmYmrxfax5xGfLF6SL2Bq7SDEzFZFyNcLvGi8ExdC5iiko",
       "name": "go-libp2p-pubsub",
       "version": "100.11.3"
+    },
+    {
+      "author": "ZenGround0",
+      "hash": "QmPuuqyMyoadGDkefg7L11kAwmvQykrHiRkuLjQRpa1bqF",
+      "name": "go-dot",
+      "version": "0.0.1"
     }
   ],
   "gxVersion": "0.11.0",

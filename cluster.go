@@ -18,6 +18,7 @@ import (
 	"github.com/ipfs/ipfs-cluster/state"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 
 	cid "github.com/ipfs/go-cid"
 	rpc "github.com/libp2p/go-libp2p-gorpc"
@@ -357,7 +358,7 @@ func (c *Cluster) repinFromPeer(p peer.ID) {
 	list := cState.List()
 	for _, pin := range list {
 		if containsPeer(pin.Allocations, p) {
-			ok, err := c.pin(pin, []peer.ID{p}, []peer.ID{}) // pin blacklisting this peer
+			ok, err := c.pin(context.TODO(), pin, []peer.ID{p}, []peer.ID{}) // pin blacklisting this peer
 			if ok && err == nil {
 				logger.Infof("repinned %s out of %s", pin.Cid, p.Pretty())
 			}
@@ -467,7 +468,7 @@ func (c *Cluster) Shutdown() error {
 		if err == nil {
 			// best effort
 			logger.Warning("attempting to leave the cluster. This may take some seconds")
-			err := c.consensus.RmPeer(c.id)
+			err := c.consensus.RmPeer(context.TODO(), c.id)
 			if err != nil {
 				logger.Error("leaving cluster: " + err.Error())
 			}
@@ -576,7 +577,7 @@ func (c *Cluster) PeerAdd(pid peer.ID) (api.ID, error) {
 	logger.Debugf("peerAdd called with %s", pid.Pretty())
 
 	// Log the new peer in the log so everyone gets it.
-	err := c.consensus.AddPeer(pid)
+	err := c.consensus.AddPeer(context.TODO(), pid)
 	if err != nil {
 		logger.Error(err)
 		id := api.ID{ID: pid, Error: err.Error()}
@@ -628,7 +629,7 @@ func (c *Cluster) PeerRemove(pid peer.ID) error {
 	logger.Infof("re-allocating all CIDs directly associated to %s", pid)
 	c.repinFromPeer(pid)
 
-	err := c.consensus.RmPeer(pid)
+	err := c.consensus.RmPeer(context.TODO(), pid)
 	if err != nil {
 		logger.Error(err)
 		return err
@@ -720,7 +721,7 @@ func (c *Cluster) StateSync() error {
 	logger.Debug("syncing state to tracker")
 	clusterPins := cState.List()
 
-	trackedPins := c.tracker.StatusAll()
+	trackedPins := c.tracker.StatusAll(c.ctx)
 	trackedPinsMap := make(map[string]int)
 	for i, tpin := range trackedPins {
 		trackedPinsMap[tpin.Cid.String()] = i
@@ -731,7 +732,7 @@ func (c *Cluster) StateSync() error {
 		_, tracked := trackedPinsMap[pin.Cid.String()]
 		if !tracked {
 			logger.Debugf("StateSync: tracking %s, part of the shared state", pin.Cid)
-			c.tracker.Track(pin)
+			c.tracker.Track(context.TODO(), pin)
 		}
 	}
 
@@ -746,13 +747,13 @@ func (c *Cluster) StateSync() error {
 		switch {
 		case !has:
 			logger.Debugf("StateSync: Untracking %s, is not part of shared state", pCid)
-			c.tracker.Untrack(pCid)
+			c.tracker.Untrack(context.TODO(), pCid)
 		case p.Status == api.TrackerStatusRemote && allocatedHere:
 			logger.Debugf("StateSync: Tracking %s locally (currently remote)", pCid)
-			c.tracker.Track(currentPin)
+			c.tracker.Track(context.TODO(), currentPin)
 		case p.Status == api.TrackerStatusPinned && !allocatedHere:
 			logger.Debugf("StateSync: Tracking %s as remote (currently local)", pCid)
-			c.tracker.Track(currentPin)
+			c.tracker.Track(context.TODO(), currentPin)
 		}
 	}
 
@@ -768,7 +769,7 @@ func (c *Cluster) StatusAll() ([]api.GlobalPinInfo, error) {
 
 // StatusAllLocal returns the PinInfo for all the tracked Cids in this peer.
 func (c *Cluster) StatusAllLocal() []api.PinInfo {
-	return c.tracker.StatusAll()
+	return c.tracker.StatusAll(c.ctx)
 }
 
 // Status returns the GlobalPinInfo for a given Cid as fetched from all
@@ -780,7 +781,7 @@ func (c *Cluster) Status(h cid.Cid) (api.GlobalPinInfo, error) {
 
 // StatusLocal returns this peer's PinInfo for a given Cid.
 func (c *Cluster) StatusLocal(h cid.Cid) api.PinInfo {
-	return c.tracker.Status(h)
+	return c.tracker.Status(c.ctx, h)
 }
 
 // SyncAll triggers SyncAllLocal() operations in all cluster peers, making sure
@@ -797,7 +798,7 @@ func (c *Cluster) SyncAll() ([]api.GlobalPinInfo, error) {
 // SyncAllLocal returns the list of PinInfo that where updated because of
 // the operation, along with those in error states.
 func (c *Cluster) SyncAllLocal() ([]api.PinInfo, error) {
-	syncedItems, err := c.tracker.SyncAll()
+	syncedItems, err := c.tracker.SyncAll(c.ctx)
 	// Despite errors, tracker provides synced items that we can provide.
 	// They encapsulate the error.
 	if err != nil {
@@ -816,7 +817,7 @@ func (c *Cluster) Sync(h cid.Cid) (api.GlobalPinInfo, error) {
 // used for RecoverLocal and SyncLocal.
 func (c *Cluster) localPinInfoOp(
 	h cid.Cid,
-	f func(cid.Cid) (api.PinInfo, error),
+	f func(context.Context, cid.Cid) (api.PinInfo, error),
 ) (pInfo api.PinInfo, err error) {
 	cids, err := c.cidsFromMetaPin(h)
 	if err != nil {
@@ -824,7 +825,7 @@ func (c *Cluster) localPinInfoOp(
 	}
 
 	for _, ci := range cids {
-		pInfo, err = f(ci)
+		pInfo, err = f(c.ctx, ci)
 		if err != nil {
 			logger.Error("tracker.SyncCid() returned with error: ", err)
 			logger.Error("Is the ipfs daemon running?")
@@ -846,7 +847,7 @@ func (c *Cluster) SyncLocal(h cid.Cid) (pInfo api.PinInfo, err error) {
 // RecoverAllLocal triggers a RecoverLocal operation for all Cids tracked
 // by this peer.
 func (c *Cluster) RecoverAllLocal() ([]api.PinInfo, error) {
-	return c.tracker.RecoverAll()
+	return c.tracker.RecoverAll(c.ctx)
 }
 
 // Recover triggers a recover operation for a given Cid in all
@@ -909,8 +910,10 @@ func (c *Cluster) PinGet(h cid.Cid) (api.Pin, error) {
 // this set then the remaining peers are allocated in order from the rest of
 // the cluster.  Priority allocations are best effort.  If any priority peers
 // are unavailable then Pin will simply allocate from the rest of the cluster.
-func (c *Cluster) Pin(pin api.Pin) error {
-	_, err := c.pin(pin, []peer.ID{}, pin.Allocations)
+func (c *Cluster) Pin(ctx context.Context, pin api.Pin) error {
+	ctx, span := trace.StartSpan(ctx, "cluster/Pin")
+	defer span.End()
+	_, err := c.pin(ctx, pin, []peer.ID{}, pin.Allocations)
 	return err
 }
 
@@ -989,7 +992,7 @@ func (c *Cluster) setupPin(pin *api.Pin) error {
 // able to evacuate a node and returns whether the pin was submitted
 // to the consensus layer or skipped (due to error or to the fact
 // that it was already valid).
-func (c *Cluster) pin(pin api.Pin, blacklist []peer.ID, prioritylist []peer.ID) (bool, error) {
+func (c *Cluster) pin(ctx context.Context, pin api.Pin, blacklist []peer.ID, prioritylist []peer.ID) (bool, error) {
 	if pin.Cid == cid.Undef {
 		return false, errors.New("bad pin object")
 	}
@@ -1000,7 +1003,7 @@ func (c *Cluster) pin(pin api.Pin, blacklist []peer.ID, prioritylist []peer.ID) 
 		return false, err
 	}
 	if pin.Type == api.MetaType {
-		return true, c.consensus.LogPin(pin)
+		return true, c.consensus.LogPin(ctx, pin)
 	}
 
 	allocs, err := c.allocate(
@@ -1027,7 +1030,7 @@ func (c *Cluster) pin(pin api.Pin, blacklist []peer.ID, prioritylist []peer.ID) 
 		logger.Infof("IPFS cluster pinning %s on %s:", pin.Cid, pin.Allocations)
 	}
 
-	return true, c.consensus.LogPin(pin)
+	return true, c.consensus.LogPin(ctx, pin)
 }
 
 // Unpin makes the cluster Unpin a Cid. This implies adding the Cid
@@ -1036,7 +1039,7 @@ func (c *Cluster) pin(pin api.Pin, blacklist []peer.ID, prioritylist []peer.ID) 
 // Unpin returns an error if the operation could not be persisted
 // to the global state. Unpin does not reflect the success or failure
 // of underlying IPFS daemon unpinning operations.
-func (c *Cluster) Unpin(h cid.Cid) error {
+func (c *Cluster) Unpin(ctx context.Context, h cid.Cid) error {
 	logger.Info("IPFS cluster unpinning:", h)
 	pin, err := c.PinGet(h)
 	if err != nil {
@@ -1045,7 +1048,7 @@ func (c *Cluster) Unpin(h cid.Cid) error {
 
 	switch pin.Type {
 	case api.DataType:
-		return c.consensus.LogUnpin(pin)
+		return c.consensus.LogUnpin(ctx, pin)
 	case api.ShardType:
 		err := "cannot unpin a shard direclty. Unpin content root CID instead."
 		return errors.New(err)
@@ -1055,7 +1058,7 @@ func (c *Cluster) Unpin(h cid.Cid) error {
 		if err != nil {
 			return err
 		}
-		return c.consensus.LogUnpin(pin)
+		return c.consensus.LogUnpin(ctx, pin)
 	case api.ClusterDAGType:
 		err := "cannot unpin a Cluster DAG directly. Unpin content root CID instead."
 		return errors.New(err)
@@ -1077,7 +1080,7 @@ func (c *Cluster) unpinClusterDag(metaPin api.Pin) error {
 	// TODO: FIXME: potentially unpinning shards which are referenced
 	// by other clusterDAGs.
 	for _, ci := range cids {
-		err = c.consensus.LogUnpin(api.PinCid(ci))
+		err = c.consensus.LogUnpin(context.TODO(), api.PinCid(ci))
 		if err != nil {
 			return err
 		}
