@@ -8,6 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gxed/opencensus-go/stats"
+	"github.com/gxed/opencensus-go/tag"
+	"github.com/gxed/opencensus-go/trace"
 	"github.com/ipfs/ipfs-cluster/adder"
 	"github.com/ipfs/ipfs-cluster/adder/local"
 	"github.com/ipfs/ipfs-cluster/adder/sharding"
@@ -16,9 +19,6 @@ import (
 	"github.com/ipfs/ipfs-cluster/pstoremgr"
 	"github.com/ipfs/ipfs-cluster/rpcutil"
 	"github.com/ipfs/ipfs-cluster/state"
-	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
-	"go.opencensus.io/trace"
 
 	cid "github.com/ipfs/go-cid"
 	rpc "github.com/libp2p/go-libp2p-gorpc"
