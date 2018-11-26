@@ -13,6 +13,7 @@ import (
 	"github.com/ipfs/ipfs-cluster/ipfsconn/ipfshttp"
 	"github.com/ipfs/ipfs-cluster/monitor/basic"
 	"github.com/ipfs/ipfs-cluster/monitor/pubsubmon"
+	"github.com/ipfs/ipfs-cluster/observations"
 	"github.com/ipfs/ipfs-cluster/pintracker/maptracker"
 	"github.com/ipfs/ipfs-cluster/pintracker/stateless"
 )
@@ -28,42 +29,7 @@ type cfgs struct {
 	pubsubmonCfg        *pubsubmon.Config
 	diskInfCfg          *disk.Config
 	numpinInfCfg        *numpin.Config
-}
-
-type tracingConfig struct {
-	Enable                  bool
-	JaegerAgentEndpoint     string
-	JaegerCollectorEndpoint string
-}
-
-func newTracingConfig() tracingConfig {
-	enablestr := os.Getenv("ENABLE_TRACING")
-	var enable bool
-	if enablestr == "" {
-		enable = false
-	}
-	return tracingConfig{
-		Enable:                  enable,
-		JaegerAgentEndpoint:     os.Getenv("JAEGER_AGENT_ENDPOINT"),
-		JaegerCollectorEndpoint: os.Getenv("JAEGER_COLLECTOR_ENDPOINT"),
-	}
-}
-
-type metricsConfig struct {
-	Enable             bool
-	PrometheusEndpoint string
-}
-
-func newMetricsConfig() metricsConfig {
-	enablestr := os.Getenv("ENABLE_METRICS")
-	var enable bool
-	if enablestr == "" {
-		enable = false
-	}
-	return metricsConfig{
-		Enable:             enable,
-		PrometheusEndpoint: os.Getenv("PROMETHEUS_ENDPOINT"),
-	}
+	obsCfg              *observations.Config
 }
 
 func makeConfigs() (*config.Manager, *cfgs) {
@@ -78,6 +44,7 @@ func makeConfigs() (*config.Manager, *cfgs) {
 	pubsubmonCfg := &pubsubmon.Config{}
 	diskInfCfg := &disk.Config{}
 	numpinInfCfg := &numpin.Config{}
+	obsCfg := &observations.Config{}
 	cfg.RegisterComponent(config.Cluster, clusterCfg)
 	cfg.RegisterComponent(config.API, apiCfg)
 	cfg.RegisterComponent(config.IPFSConn, ipfshttpCfg)
@@ -88,6 +55,7 @@ func makeConfigs() (*config.Manager, *cfgs) {
 	cfg.RegisterComponent(config.Monitor, pubsubmonCfg)
 	cfg.RegisterComponent(config.Informer, diskInfCfg)
 	cfg.RegisterComponent(config.Informer, numpinInfCfg)
+	cfg.RegisterComponent(config.Observations, obsCfg)
 	return cfg, &cfgs{
 		clusterCfg,
 		apiCfg,
@@ -99,6 +67,7 @@ func makeConfigs() (*config.Manager, *cfgs) {
 		pubsubmonCfg,
 		diskInfCfg,
 		numpinInfCfg,
+		obsCfg,
 	}
 }
 

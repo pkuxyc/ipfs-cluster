@@ -32,11 +32,12 @@ func testClients(t *testing.T, api *rest.API, f func(*testing.T, Client)) {
 }
 
 func TestVersion(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		v, err := c.Version()
+		v, err := c.Version(ctx)
 		if err != nil || v.Version == "" {
 			t.Logf("%+v", v)
 			t.Log(err)
@@ -48,11 +49,12 @@ func TestVersion(t *testing.T) {
 }
 
 func TestID(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		id, err := c.ID()
+		id, err := c.ID(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,11 +67,12 @@ func TestID(t *testing.T) {
 }
 
 func TestPeers(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ids, err := c.Peers()
+		ids, err := c.Peers(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,13 +85,14 @@ func TestPeers(t *testing.T) {
 }
 
 func TestPeersWithError(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		addr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/44444")
 		c, _ = NewDefaultClient(&Config{APIAddr: addr, DisableKeepAlives: true})
-		ids, err := c.Peers()
+		ids, err := c.Peers(ctx)
 		if err == nil {
 			t.Fatal("expected error")
 		}
@@ -101,11 +105,12 @@ func TestPeersWithError(t *testing.T) {
 }
 
 func TestPeerAdd(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		id, err := c.PeerAdd(test.TestPeerID1)
+		id, err := c.PeerAdd(ctx, test.TestPeerID1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -118,11 +123,12 @@ func TestPeerAdd(t *testing.T) {
 }
 
 func TestPeerRm(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		err := c.PeerRm(test.TestPeerID1)
+		err := c.PeerRm(ctx, test.TestPeerID1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,11 +170,12 @@ func TestUnpin(t *testing.T) {
 }
 
 func TestAllocations(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.Allocations(types.DataType | types.MetaType)
+		pins, err := c.Allocations(ctx, types.DataType|types.MetaType)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,12 +188,13 @@ func TestAllocations(t *testing.T) {
 }
 
 func TestAllocation(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Allocation(ci)
+		pin, err := c.Allocation(ctx, ci)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -199,12 +207,13 @@ func TestAllocation(t *testing.T) {
 }
 
 func TestStatus(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Status(ci, false)
+		pin, err := c.Status(ctx, ci, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,11 +226,12 @@ func TestStatus(t *testing.T) {
 }
 
 func TestStatusAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.StatusAll(false)
+		pins, err := c.StatusAll(ctx, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -235,12 +245,13 @@ func TestStatusAll(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Sync(ci, false)
+		pin, err := c.Sync(ctx, ci, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,11 +264,12 @@ func TestSync(t *testing.T) {
 }
 
 func TestSyncAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.SyncAll(false)
+		pins, err := c.SyncAll(ctx, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,12 +283,13 @@ func TestSyncAll(t *testing.T) {
 }
 
 func TestRecover(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Recover(ci, false)
+		pin, err := c.Recover(ctx, ci, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -289,11 +302,12 @@ func TestRecover(t *testing.T) {
 }
 
 func TestRecoverAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		_, err := c.RecoverAll(true)
+		_, err := c.RecoverAll(ctx, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -303,11 +317,12 @@ func TestRecoverAll(t *testing.T) {
 }
 
 func TestGetConnectGraph(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		cg, err := c.GetConnectGraph()
+		cg, err := c.GetConnectGraph(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -434,8 +449,9 @@ func TestWaitFor(t *testing.T) {
 }
 
 func TestAddMultiFile(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
-	defer api.Shutdown()
+	defer api.Shutdown(ctx)
 
 	testF := func(t *testing.T, c Client) {
 		sth := test.NewShardingTestHelper()
@@ -467,7 +483,7 @@ func TestAddMultiFile(t *testing.T) {
 			}
 		}()
 
-		err := c.AddMultiFile(mfr, p, out)
+		err := c.AddMultiFile(ctx, mfr, p, out)
 		if err != nil {
 			t.Fatal(err)
 		}

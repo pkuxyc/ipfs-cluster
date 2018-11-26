@@ -56,6 +56,7 @@ const (
 	Allocator
 	Informer
 	Sharder
+	Observations
 )
 
 // SectionType specifies to which section a component configuration belongs.
@@ -156,16 +157,17 @@ func (cfg *Manager) watchSave(save <-chan struct{}) {
 // saved using json. Most configuration keys are converted into simple types
 // like strings, and key names aim to be self-explanatory for the user.
 type jsonConfig struct {
-	Cluster    *json.RawMessage `json:"cluster"`
-	Consensus  jsonSection      `json:"consensus,omitempty"`
-	API        jsonSection      `json:"api,omitempty"`
-	IPFSConn   jsonSection      `json:"ipfs_connector,omitempty"`
-	State      jsonSection      `json:"state,omitempty"`
-	PinTracker jsonSection      `json:"pin_tracker,omitempty"`
-	Monitor    jsonSection      `json:"monitor,omitempty"`
-	Allocator  jsonSection      `json:"allocator,omitempty"`
-	Informer   jsonSection      `json:"informer,omitempty"`
-	Sharder    jsonSection      `json:"sharder,omitempty"`
+	Cluster      *json.RawMessage `json:"cluster"`
+	Consensus    jsonSection      `json:"consensus,omitempty"`
+	API          jsonSection      `json:"api,omitempty"`
+	IPFSConn     jsonSection      `json:"ipfs_connector,omitempty"`
+	State        jsonSection      `json:"state,omitempty"`
+	PinTracker   jsonSection      `json:"pin_tracker,omitempty"`
+	Monitor      jsonSection      `json:"monitor,omitempty"`
+	Allocator    jsonSection      `json:"allocator,omitempty"`
+	Informer     jsonSection      `json:"informer,omitempty"`
+	Sharder      jsonSection      `json:"sharder,omitempty"`
+	Observations jsonSection      `json:"observations,omitempty"`
 }
 
 // Default generates a default configuration by generating defaults for all
@@ -315,6 +317,7 @@ func (cfg *Manager) LoadJSON(bs []byte) error {
 	loadCompJSON(sections[Allocator], jcfg.Allocator)
 	loadCompJSON(sections[Informer], jcfg.Informer)
 	loadCompJSON(sections[Sharder], jcfg.Informer)
+	loadCompJSON(sections[Observations], jcfg.Observations)
 	return cfg.Validate()
 }
 
@@ -402,6 +405,8 @@ func (cfg *Manager) ToJSON() ([]byte, error) {
 			err = updateJSONConfigs(v, &jcfg.Informer)
 		case Sharder:
 			err = updateJSONConfigs(v, &jcfg.Sharder)
+		case Observations:
+			err = updateJSONConfigs(v, &jcfg.Observations)
 		}
 		if err != nil {
 			return nil, err

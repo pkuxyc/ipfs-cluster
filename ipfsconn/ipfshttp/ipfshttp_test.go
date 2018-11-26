@@ -46,15 +46,17 @@ func testIPFSConnector(t *testing.T) (*Connector, *test.IpfsMock) {
 }
 
 func TestNewConnector(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 }
 
 func TestIPFSID(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
-	defer ipfs.Shutdown()
-	id, err := ipfs.ID()
+	defer ipfs.Shutdown(ctx)
+	id, err := ipfs.ID(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +70,7 @@ func TestIPFSID(t *testing.T) {
 		t.Error("expected no error")
 	}
 	mock.Close()
-	id, err = ipfs.ID()
+	id, err = ipfs.ID(ctx)
 	if err == nil {
 		t.Error("expected an error")
 	}
@@ -81,7 +83,7 @@ func testPin(t *testing.T, method string) {
 	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	ipfs.config.PinMethod = method
 
@@ -114,7 +116,7 @@ func TestIPFSUnpin(t *testing.T) {
 	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	c, _ := cid.Decode(test.TestCid1)
 	err := ipfs.Unpin(ctx, c)
 	if err != nil {
@@ -131,7 +133,7 @@ func TestIPFSPinLsCid(t *testing.T) {
 	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	c, _ := cid.Decode(test.TestCid1)
 	c2, _ := cid.Decode(test.TestCid2)
 
@@ -151,7 +153,7 @@ func TestIPFSPinLs(t *testing.T) {
 	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	c, _ := cid.Decode(test.TestCid1)
 	c2, _ := cid.Decode(test.TestCid2)
 
@@ -172,9 +174,10 @@ func TestIPFSPinLs(t *testing.T) {
 }
 
 func TestIPFSProxyVersion(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	res, err := http.Post(fmt.Sprintf("%s/version", proxyURL(ipfs)), "", nil)
 	if err != nil {
@@ -201,9 +204,10 @@ func TestIPFSProxyVersion(t *testing.T) {
 }
 
 func TestIPFSProxyPin(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	type args struct {
 		urlPath    string
@@ -303,9 +307,10 @@ func TestIPFSProxyPin(t *testing.T) {
 }
 
 func TestIPFSProxyUnpin(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	type args struct {
 		urlPath    string
@@ -405,9 +410,10 @@ func TestIPFSProxyUnpin(t *testing.T) {
 }
 
 func TestIPFSProxyPinLs(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	t.Run("pin/ls query arg", func(t *testing.T) {
 		res, err := http.Post(fmt.Sprintf("%s/pin/ls?arg=%s", proxyURL(ipfs), test.TestCid1), "", nil)
@@ -490,9 +496,10 @@ func TestIPFSProxyPinLs(t *testing.T) {
 }
 
 func TestProxyRepoStat(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	res, err := http.Post(fmt.Sprintf("%s/repo/stat", proxyURL(ipfs)), "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -519,9 +526,10 @@ func TestProxyRepoStat(t *testing.T) {
 }
 
 func TestProxyAdd(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	type testcase struct {
 		query       string
@@ -591,9 +599,10 @@ func TestProxyAdd(t *testing.T) {
 }
 
 func TestProxyAddError(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	res, err := http.Post(fmt.Sprintf("%s/add?recursive=true", proxyURL(ipfs)), "", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -605,9 +614,10 @@ func TestProxyAddError(t *testing.T) {
 }
 
 func TestProxyError(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	res, err := http.Post(fmt.Sprintf("%s/bad/command", proxyURL(ipfs)), "", nil)
 	if err != nil {
@@ -620,12 +630,13 @@ func TestProxyError(t *testing.T) {
 }
 
 func TestIPFSShutdown(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	if err := ipfs.Shutdown(); err != nil {
+	if err := ipfs.Shutdown(ctx); err != nil {
 		t.Error("expected a clean shutdown")
 	}
-	if err := ipfs.Shutdown(); err != nil {
+	if err := ipfs.Shutdown(ctx); err != nil {
 		t.Error("expected a second clean shutdown")
 	}
 }
@@ -636,18 +647,20 @@ func TestConnectSwarms(t *testing.T) {
 	// ipfs mock
 	// logging.SetDebugLogging()
 
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 	time.Sleep(time.Second)
 }
 
 func TestSwarmPeers(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
-	swarmPeers, err := ipfs.SwarmPeers()
+	swarmPeers, err := ipfs.SwarmPeers(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,12 +676,13 @@ func TestSwarmPeers(t *testing.T) {
 }
 
 func TestBlockPut(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	data := []byte(test.TestCid4Data)
-	err := ipfs.BlockPut(api.NodeWithMeta{
+	err := ipfs.BlockPut(ctx, api.NodeWithMeta{
 		Data:   data,
 		Cid:    test.TestCid4,
 		Format: "raw",
@@ -679,22 +693,23 @@ func TestBlockPut(t *testing.T) {
 }
 
 func TestBlockGet(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	shardCid, err := cid.Decode(test.TestShardCid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Fail when getting before putting
-	_, err = ipfs.BlockGet(shardCid)
+	_, err = ipfs.BlockGet(ctx, shardCid)
 	if err == nil {
 		t.Fatal("expected to fail getting unput block")
 	}
 
 	// Put and then successfully get
-	err = ipfs.BlockPut(api.NodeWithMeta{
+	err = ipfs.BlockPut(ctx, api.NodeWithMeta{
 		Data:   test.TestShardData,
 		Cid:    test.TestShardCid,
 		Format: "cbor",
@@ -703,7 +718,7 @@ func TestBlockGet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := ipfs.BlockGet(shardCid)
+	data, err := ipfs.BlockGet(ctx, shardCid)
 	if err != nil {
 		t.Error(err)
 	}
@@ -716,9 +731,9 @@ func TestRepoStat(t *testing.T) {
 	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
-	s, err := ipfs.RepoStat()
+	s, err := ipfs.RepoStat(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,7 +748,7 @@ func TestRepoStat(t *testing.T) {
 		t.Error("expected success pinning cid")
 	}
 
-	s, err = ipfs.RepoStat()
+	s, err = ipfs.RepoStat(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,9 +758,10 @@ func TestRepoStat(t *testing.T) {
 }
 
 func TestConfigKey(t *testing.T) {
+	ctx := context.Background()
 	ipfs, mock := testIPFSConnector(t)
 	defer mock.Close()
-	defer ipfs.Shutdown()
+	defer ipfs.Shutdown(ctx)
 
 	v, err := ipfs.ConfigKey("Datastore/StorageMax")
 	if err != nil {
