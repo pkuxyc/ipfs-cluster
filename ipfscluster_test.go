@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -16,22 +17,27 @@ import (
 	"github.com/ipfs/ipfs-cluster/allocator/descendalloc"
 	"github.com/ipfs/ipfs-cluster/api"
 	"github.com/ipfs/ipfs-cluster/api/rest"
+	"github.com/ipfs/ipfs-cluster/consensus/crdt"
 	"github.com/ipfs/ipfs-cluster/consensus/raft"
+	"github.com/ipfs/ipfs-cluster/datastore/badger"
+	"github.com/ipfs/ipfs-cluster/datastore/inmem"
 	"github.com/ipfs/ipfs-cluster/informer/disk"
 	"github.com/ipfs/ipfs-cluster/ipfsconn/ipfshttp"
-	"github.com/ipfs/ipfs-cluster/monitor/basic"
 	"github.com/ipfs/ipfs-cluster/monitor/pubsubmon"
+	"github.com/ipfs/ipfs-cluster/observations"
 	"github.com/ipfs/ipfs-cluster/pintracker/maptracker"
 	"github.com/ipfs/ipfs-cluster/pintracker/stateless"
-	"github.com/ipfs/ipfs-cluster/state"
-	"github.com/ipfs/ipfs-cluster/state/mapstate"
 	"github.com/ipfs/ipfs-cluster/test"
+	"github.com/ipfs/ipfs-cluster/version"
 
-	cid "github.com/ipfs/go-cid"
+	ds "github.com/ipfs/go-datastore"
+	libp2p "github.com/libp2p/go-libp2p"
 	crypto "github.com/libp2p/go-libp2p-crypto"
 	host "github.com/libp2p/go-libp2p-host"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	peer "github.com/libp2p/go-libp2p-peer"
 	peerstore "github.com/libp2p/go-libp2p-peerstore"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -45,8 +51,10 @@ var (
 	logLevel               = "CRITICAL"
 	customLogLvlFacilities = logFacilities{}
 
-	pmonitor = "pubsub"
-	ptracker = "map"
+	ptracker  = "map"
+	consensus = "raft"
+
+	testsFolder = "clusterTestsFolder"
 
 	// When testing with fixed ports...
 	// clusterPort   = 10000
@@ -77,8 +85,8 @@ func init() {
 	flag.StringVar(&logLevel, "loglevel", logLevel, "default log level for tests")
 	flag.IntVar(&nClusters, "nclusters", nClusters, "number of clusters to use")
 	flag.IntVar(&nPins, "npins", nPins, "number of pins to pin/unpin/check")
-	flag.StringVar(&pmonitor, "monitor", pmonitor, "monitor implementation")
 	flag.StringVar(&ptracker, "tracker", ptracker, "tracker implementation")
+	flag.StringVar(&consensus, "consensus", consensus, "consensus implementation")
 	flag.Parse()
 
 	rand.Seed(time.Now().UnixNano())
@@ -104,6 +112,10 @@ func init() {
 		}
 	}
 	ReadyTimeout = 11 * time.Second
+
+	// GossipSub needs to heartbeat to discover newly connected hosts
+	// This speeds things up a little.
+	pubsub.GossipSubHeartbeatInterval = 50 * time.Millisecond
 }
 
 func checkErr(t *testing.T, err error) {
@@ -121,12 +133,29 @@ func randomBytes() []byte {
 	return bs
 }
 
-func createComponents(t *testing.T, i int, clusterSecret []byte, staging bool) (host.Host, *Config, *raft.Consensus, API, IPFSConnector, state.State, PinTracker, PeerMonitor, PinAllocator, Informer, *test.IpfsMock) {
-	mock := test.NewIpfsMock()
-	//
-	//clusterAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", clusterPort+i))
-	// Bind on port 0
-	clusterAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
+func createComponents(
+	t *testing.T,
+	host host.Host,
+	pubsub *pubsub.PubSub,
+	dht *dht.IpfsDHT,
+	i int,
+	staging bool,
+) (
+	*Config,
+	ds.Datastore,
+	Consensus,
+	[]API,
+	IPFSConnector,
+	PinTracker,
+	PeerMonitor,
+	PinAllocator,
+	Informer,
+	Tracer,
+	*test.IpfsMock,
+) {
+	ctx := context.Background()
+	mock := test.NewIpfsMock(t)
+
 	//apiAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", apiPort+i))
 	// Bind on port 0
 	apiAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
@@ -134,61 +163,82 @@ func createComponents(t *testing.T, i int, clusterSecret []byte, staging bool) (
 	// proxyAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", ipfsProxyPort+i))
 	proxyAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
 	nodeAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", mock.Addr, mock.Port))
-	priv, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	checkErr(t, err)
-	pid, err := peer.IDFromPublicKey(pub)
-	checkErr(t, err)
+
 	peername := fmt.Sprintf("peer_%d", i)
 
-	clusterCfg, apiCfg, ipfshttpCfg, consensusCfg, maptrackerCfg, statelesstrackerCfg, bmonCfg, psmonCfg, diskInfCfg := testingConfigs()
+	ident, clusterCfg, apiCfg, ipfsproxyCfg, ipfshttpCfg, badgerCfg, raftCfg, crdtCfg, maptrackerCfg, statelesstrackerCfg, psmonCfg, diskInfCfg, tracingCfg := testingConfigs()
 
-	clusterCfg.ID = pid
+	ident.ID = host.ID()
+	ident.PrivateKey = host.Peerstore().PrivKey(host.ID())
 	clusterCfg.Peername = peername
-	clusterCfg.PrivateKey = priv
-	clusterCfg.Secret = clusterSecret
-	clusterCfg.ListenAddr = clusterAddr
 	clusterCfg.LeaveOnShutdown = false
-	clusterCfg.SetBaseDir("./e2eTestRaft/" + pid.Pretty())
-
-	host, err := NewClusterHost(context.Background(), clusterCfg)
-	checkErr(t, err)
+	clusterCfg.SetBaseDir(filepath.Join(testsFolder, host.ID().Pretty()))
 
 	apiCfg.HTTPListenAddr = apiAddr
-	ipfshttpCfg.ProxyAddr = proxyAddr
-	ipfshttpCfg.NodeAddr = nodeAddr
-	consensusCfg.DataFolder = "./e2eTestRaft/" + pid.Pretty()
 
-	api, err := rest.NewAPI(apiCfg)
+	ipfsproxyCfg.ListenAddr = proxyAddr
+	ipfsproxyCfg.NodeAddr = nodeAddr
+
+	ipfshttpCfg.NodeAddr = nodeAddr
+
+	raftCfg.DataFolder = filepath.Join(testsFolder, host.ID().Pretty())
+
+	badgerCfg.Folder = filepath.Join(testsFolder, host.ID().Pretty(), "badger")
+
+	api, err := rest.NewAPI(ctx, apiCfg)
 	checkErr(t, err)
+	ipfsProxy, err := rest.NewAPI(ctx, apiCfg)
+	checkErr(t, err)
+
 	ipfs, err := ipfshttp.NewConnector(ipfshttpCfg)
 	checkErr(t, err)
-	state := mapstate.NewMapState()
-	tracker := makePinTracker(t, clusterCfg.ID, maptrackerCfg, statelesstrackerCfg, clusterCfg.Peername)
-
-	mon := makeMonitor(t, host, bmonCfg, psmonCfg)
+	tracker := makePinTracker(t, ident.ID, maptrackerCfg, statelesstrackerCfg, clusterCfg.Peername)
 
 	alloc := descendalloc.NewAllocator()
 	inf, err := disk.NewInformer(diskInfCfg)
 	checkErr(t, err)
-	raftCon, err := raft.NewConsensus(host, consensusCfg, state, staging)
+
+	store := makeStore(t, badgerCfg)
+	cons := makeConsensus(t, store, host, pubsub, dht, raftCfg, staging, crdtCfg)
+
+	var peersF func(context.Context) ([]peer.ID, error)
+	if consensus == "raft" {
+		peersF = cons.Peers
+	}
+	mon, err := pubsubmon.New(ctx, psmonCfg, pubsub, peersF)
 	checkErr(t, err)
 
-	return host, clusterCfg, raftCon, api, ipfs, state, tracker, mon, alloc, inf, mock
+	tracingCfg.ServiceName = peername
+	tracer, err := observations.SetupTracing(tracingCfg)
+	checkErr(t, err)
+
+	return clusterCfg, store, cons, []API{api, ipfsProxy}, ipfs, tracker, mon, alloc, inf, tracer, mock
 }
 
-func makeMonitor(t *testing.T, h host.Host, bmonCfg *basic.Config, psmonCfg *pubsubmon.Config) PeerMonitor {
-	var mon PeerMonitor
-	var err error
-	switch pmonitor {
-	case "basic":
-		mon, err = basic.NewMonitor(bmonCfg)
-	case "pubsub":
-		mon, err = pubsubmon.New(h, psmonCfg)
+func makeStore(t *testing.T, badgerCfg *badger.Config) ds.Datastore {
+	switch consensus {
+	case "crdt":
+		dstr, err := badger.New(badgerCfg)
+		checkErr(t, err)
+		return dstr
 	default:
-		panic("bad monitor")
+		return inmem.New()
 	}
-	checkErr(t, err)
-	return mon
+}
+
+func makeConsensus(t *testing.T, store ds.Datastore, h host.Host, psub *pubsub.PubSub, dht *dht.IpfsDHT, raftCfg *raft.Config, staging bool, crdtCfg *crdt.Config) Consensus {
+	switch consensus {
+	case "raft":
+		raftCon, err := raft.NewConsensus(h, raftCfg, store, staging)
+		checkErr(t, err)
+		return raftCon
+	case "crdt":
+		crdtCon, err := crdt.New(h, dht, psub, crdtCfg, store)
+		checkErr(t, err)
+		return crdtCon
+	default:
+		panic("bad consensus")
+	}
 }
 
 func makePinTracker(t *testing.T, pid peer.ID, mptCfg *maptracker.Config, sptCfg *stateless.Config, peerName string) PinTracker {
@@ -204,97 +254,147 @@ func makePinTracker(t *testing.T, pid peer.ID, mptCfg *maptracker.Config, sptCfg
 	return ptrkr
 }
 
-func createCluster(t *testing.T, host host.Host, clusterCfg *Config, raftCons *raft.Consensus, api API, ipfs IPFSConnector, state state.State, tracker PinTracker, mon PeerMonitor, alloc PinAllocator, inf Informer) *Cluster {
-	cl, err := NewCluster(host, clusterCfg, raftCons, api, ipfs, state, tracker, mon, alloc, inf)
+func createCluster(t *testing.T, host host.Host, dht *dht.IpfsDHT, clusterCfg *Config, store ds.Datastore, consensus Consensus, apis []API, ipfs IPFSConnector, tracker PinTracker, mon PeerMonitor, alloc PinAllocator, inf Informer, tracer Tracer) *Cluster {
+	cl, err := NewCluster(context.Background(), host, dht, clusterCfg, store, consensus, apis, ipfs, tracker, mon, alloc, inf, tracer)
 	checkErr(t, err)
 	return cl
 }
 
 func createOnePeerCluster(t *testing.T, nth int, clusterSecret []byte) (*Cluster, *test.IpfsMock) {
-	host, clusterCfg, consensusCfg, api, ipfs, state, tracker, mon, alloc, inf, mock := createComponents(t, nth, clusterSecret, false)
-	cl := createCluster(t, host, clusterCfg, consensusCfg, api, ipfs, state, tracker, mon, alloc, inf)
+	hosts, pubsubs, dhts := createHosts(t, clusterSecret, 1)
+	clusterCfg, store, consensus, api, ipfs, tracker, mon, alloc, inf, tracer, mock := createComponents(t, hosts[0], pubsubs[0], dhts[0], nth, false)
+	cl := createCluster(t, hosts[0], dhts[0], clusterCfg, store, consensus, api, ipfs, tracker, mon, alloc, inf, tracer)
 	<-cl.Ready()
 	return cl, mock
 }
 
+func createHosts(t *testing.T, clusterSecret []byte, nClusters int) ([]host.Host, []*pubsub.PubSub, []*dht.IpfsDHT) {
+	hosts := make([]host.Host, nClusters, nClusters)
+	pubsubs := make([]*pubsub.PubSub, nClusters, nClusters)
+	dhts := make([]*dht.IpfsDHT, nClusters, nClusters)
+
+	listen, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
+	for i := range hosts {
+		priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		checkErr(t, err)
+
+		h, p, d := createHost(t, priv, clusterSecret, listen)
+		hosts[i] = h
+		dhts[i] = d
+		pubsubs[i] = p
+	}
+
+	return hosts, pubsubs, dhts
+}
+
+func createHost(t *testing.T, priv crypto.PrivKey, clusterSecret []byte, listen ma.Multiaddr) (host.Host, *pubsub.PubSub, *dht.IpfsDHT) {
+	ctx := context.Background()
+	h, err := newHost(ctx, clusterSecret, priv, libp2p.ListenAddrs(listen))
+	checkErr(t, err)
+
+	// DHT needs to be created BEFORE connecting the peers, but
+	// bootstrapped AFTER
+	d, err := newDHT(ctx, h)
+	checkErr(t, err)
+
+	// Pubsub needs to be created BEFORE connecting the peers,
+	// otherwise they are not picked up.
+	psub, err := newPubSub(ctx, h)
+	checkErr(t, err)
+	return routedHost(h, d), psub, d
+}
+
 func createClusters(t *testing.T) ([]*Cluster, []*test.IpfsMock) {
-	os.RemoveAll("./e2eTestRaft")
+	ctx := context.Background()
+	os.RemoveAll(testsFolder)
 	cfgs := make([]*Config, nClusters, nClusters)
-	raftCons := make([]*raft.Consensus, nClusters, nClusters)
-	apis := make([]API, nClusters, nClusters)
+	stores := make([]ds.Datastore, nClusters, nClusters)
+	cons := make([]Consensus, nClusters, nClusters)
+	apis := make([][]API, nClusters, nClusters)
 	ipfss := make([]IPFSConnector, nClusters, nClusters)
-	states := make([]state.State, nClusters, nClusters)
 	trackers := make([]PinTracker, nClusters, nClusters)
 	mons := make([]PeerMonitor, nClusters, nClusters)
 	allocs := make([]PinAllocator, nClusters, nClusters)
 	infs := make([]Informer, nClusters, nClusters)
+	tracers := make([]Tracer, nClusters, nClusters)
 	ipfsMocks := make([]*test.IpfsMock, nClusters, nClusters)
 
-	hosts := make([]host.Host, nClusters, nClusters)
 	clusters := make([]*Cluster, nClusters, nClusters)
 
 	// Uncomment when testing with fixed ports
 	// clusterPeers := make([]ma.Multiaddr, nClusters, nClusters)
 
+	hosts, pubsubs, dhts := createHosts(t, testingClusterSecret, nClusters)
+
 	for i := 0; i < nClusters; i++ {
 		// staging = true for all except first (i==0)
-		host, clusterCfg, raftCon, api, ipfs, state, tracker, mon, alloc, inf, mock := createComponents(t, i, testingClusterSecret, i != 0)
-		hosts[i] = host
-		cfgs[i] = clusterCfg
-		raftCons[i] = raftCon
-		apis[i] = api
-		ipfss[i] = ipfs
-		states[i] = state
-		trackers[i] = tracker
-		mons[i] = mon
-		allocs[i] = alloc
-		infs[i] = inf
-		ipfsMocks[i] = mock
-	}
-
-	// open connections among all hosts
-	for _, h := range hosts {
-		for _, h2 := range hosts {
-			if h.ID() != h2.ID() {
-
-				h.Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.PermanentAddrTTL)
-				_, err := h.Network().DialPeer(context.Background(), h2.ID())
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
+		cfgs[i], stores[i], cons[i], apis[i], ipfss[i], trackers[i], mons[i], allocs[i], infs[i], tracers[i], ipfsMocks[i] = createComponents(t, hosts[i], pubsubs[i], dhts[i], i, i != 0)
 	}
 
 	// Start first node
-	clusters[0] = createCluster(t, hosts[0], cfgs[0], raftCons[0], apis[0], ipfss[0], states[0], trackers[0], mons[0], allocs[0], infs[0])
+	clusters[0] = createCluster(t, hosts[0], dhts[0], cfgs[0], stores[0], cons[0], apis[0], ipfss[0], trackers[0], mons[0], allocs[0], infs[0], tracers[0])
 	<-clusters[0].Ready()
 	bootstrapAddr := clusterAddr(clusters[0])
 
 	// Start the rest and join
 	for i := 1; i < nClusters; i++ {
-		clusters[i] = createCluster(t, hosts[i], cfgs[i], raftCons[i], apis[i], ipfss[i], states[i], trackers[i], mons[i], allocs[i], infs[i])
-		err := clusters[i].Join(bootstrapAddr)
+		clusters[i] = createCluster(t, hosts[i], dhts[i], cfgs[i], stores[i], cons[i], apis[i], ipfss[i], trackers[i], mons[i], allocs[i], infs[i], tracers[i])
+		for j := 0; j < i; j++ {
+			// all previous clusters trust the new one
+			clusters[j].consensus.Trust(ctx, hosts[i].ID())
+			// new cluster trusts all the previous
+			clusters[i].consensus.Trust(ctx, hosts[j].ID())
+		}
+
+		err := clusters[i].Join(ctx, bootstrapAddr)
 		if err != nil {
 			logger.Error(err)
 			t.Fatal(err)
 		}
 		<-clusters[i].Ready()
 	}
+
+	// connect all hosts
+	for _, h := range hosts {
+		for _, h2 := range hosts {
+			if h.ID() != h2.ID() {
+				h.Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.PermanentAddrTTL)
+				_, err := h.Network().DialPeer(ctx, h2.ID())
+				if err != nil {
+					t.Log(err)
+				}
+			}
+
+		}
+	}
+
+	// // Bootstrap the DHTs
+	dhtCfg := dht.BootstrapConfig{
+		Queries: 1,
+		Period:  600 * time.Millisecond,
+		Timeout: 300 * time.Millisecond,
+	}
+
+	for _, d := range dhts {
+		d.BootstrapWithConfig(ctx, dhtCfg)
+	}
+
 	waitForLeader(t, clusters)
+	waitForClustersHealthy(t, clusters)
 
 	return clusters, ipfsMocks
 }
 
 func shutdownClusters(t *testing.T, clusters []*Cluster, m []*test.IpfsMock) {
+	ctx := context.Background()
 	for i, c := range clusters {
-		err := c.Shutdown()
+		err := c.Shutdown(ctx)
 		if err != nil {
 			t.Error(err)
 		}
 		m[i].Close()
 	}
-	os.RemoveAll("./e2eTestRaft")
+	os.RemoveAll(testsFolder)
 }
 
 func runF(t *testing.T, clusters []*Cluster, f func(*testing.T, *Cluster)) {
@@ -336,7 +436,7 @@ func delay() {
 }
 
 func pinDelay() {
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond)
 }
 
 func ttlDelay() {
@@ -355,6 +455,10 @@ func waitForLeaderAndMetrics(t *testing.T, clusters []*Cluster) {
 
 // Makes sure there is a leader and everyone knows about it.
 func waitForLeader(t *testing.T, clusters []*Cluster) {
+	if consensus == "crdt" {
+		return // yai
+	}
+	ctx := context.Background()
 	timer := time.NewTimer(time.Minute)
 	ticker := time.NewTicker(100 * time.Millisecond)
 
@@ -368,12 +472,40 @@ loop:
 				if cl.shutdownB {
 					continue // skip shutdown clusters
 				}
-				_, err := cl.consensus.Leader()
+				_, err := cl.consensus.Leader(ctx)
 				if err != nil {
 					continue loop
 				}
 			}
 			break loop
+		}
+	}
+}
+
+func waitForClustersHealthy(t *testing.T, clusters []*Cluster) {
+	t.Helper()
+	if len(clusters) == 0 {
+		return
+	}
+
+	timer := time.NewTimer(15 * time.Second)
+	for {
+		ttlDelay()
+		metrics := clusters[0].monitor.LatestMetrics(context.Background(), clusters[0].informer.Name())
+		healthy := 0
+		for _, m := range metrics {
+			if !m.Expired() {
+				healthy++
+			}
+		}
+		if len(clusters) == healthy {
+			return
+		}
+
+		select {
+		case <-timer.C:
+			t.Fatal("timed out waiting for clusters to be healthy")
+		default:
 		}
 	}
 }
@@ -385,7 +517,7 @@ func TestClustersVersion(t *testing.T) {
 	defer shutdownClusters(t, clusters, mock)
 	f := func(t *testing.T, c *Cluster) {
 		v := c.Version()
-		if v != Version.String() {
+		if v != version.Version.String() {
 			t.Error("Bad version")
 		}
 	}
@@ -393,25 +525,32 @@ func TestClustersVersion(t *testing.T) {
 }
 
 func TestClustersPeers(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 
+	delay()
+
 	j := rand.Intn(nClusters) // choose a random cluster peer
-	peers := clusters[j].Peers()
+	peers := clusters[j].Peers(ctx)
 
 	if len(peers) != nClusters {
 		t.Fatal("expected as many peers as clusters")
 	}
 
-	clusterIDMap := make(map[peer.ID]api.ID)
-	peerIDMap := make(map[peer.ID]api.ID)
+	clusterIDMap := make(map[peer.ID]*api.ID)
+	peerIDMap := make(map[peer.ID]*api.ID)
 
 	for _, c := range clusters {
-		id := c.ID()
+		id := c.ID(ctx)
 		clusterIDMap[id.ID] = id
 	}
 
 	for _, p := range peers {
+		if p.Error != "" {
+			t.Error(p.ID, p.Error)
+			continue
+		}
 		peerIDMap[p.ID] = p
 	}
 
@@ -430,10 +569,10 @@ func TestClustersPeers(t *testing.T) {
 }
 
 func TestClustersPin(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	exampleCid, _ := cid.Decode(test.TestCid1)
-	prefix := exampleCid.Prefix()
+	prefix := test.Cid1.Prefix()
 
 	ttlDelay()
 
@@ -441,19 +580,24 @@ func TestClustersPin(t *testing.T) {
 		j := rand.Intn(nClusters)           // choose a random cluster peer
 		h, err := prefix.Sum(randomBytes()) // create random cid
 		checkErr(t, err)
-		err = clusters[j].Pin(api.PinCid(h))
+		err = clusters[j].Pin(ctx, api.PinCid(h))
 		if err != nil {
 			t.Errorf("error pinning %s: %s", h, err)
 		}
-		// Test re-pin
-		err = clusters[j].Pin(api.PinCid(h))
-		if err != nil {
-			t.Errorf("error repinning %s: %s", h, err)
-		}
+		// // Test re-pin
+		// err = clusters[j].Pin(ctx, api.PinCid(h))
+		// if err != nil {
+		// 	t.Errorf("error repinning %s: %s", h, err)
+		// }
 	}
-	delay()
+	switch consensus {
+	case "crdt":
+		time.Sleep(20 * time.Second)
+	default:
+		delay()
+	}
 	fpinned := func(t *testing.T, c *Cluster) {
-		status := c.tracker.StatusAll()
+		status := c.tracker.StatusAll(ctx)
 		for _, v := range status {
 			if v.Status != api.TrackerStatusPinned {
 				t.Errorf("%s should have been pinned but it is %s", v.Cid, v.Status)
@@ -466,28 +610,35 @@ func TestClustersPin(t *testing.T) {
 	runF(t, clusters, fpinned)
 
 	// Unpin everything
-	pinList := clusters[0].Pins()
+	pinList, err := clusters[0].Pins(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pinList) != nPins {
+		t.Fatalf("pin list has %d but pinned %d", len(pinList), nPins)
+	}
 
 	for i := 0; i < len(pinList); i++ {
 		// test re-unpin fails
 		j := rand.Intn(nClusters) // choose a random cluster peer
-		err := clusters[j].Unpin(pinList[i].Cid)
+		err := clusters[j].Unpin(ctx, pinList[i].Cid)
 		if err != nil {
 			t.Errorf("error unpinning %s: %s", pinList[i].Cid, err)
 		}
 	}
 	delay()
-	for i := 0; i < nPins; i++ {
+	for i := 0; i < len(pinList); i++ {
 		j := rand.Intn(nClusters) // choose a random cluster peer
-		err := clusters[j].Unpin(pinList[i].Cid)
+		err := clusters[j].Unpin(ctx, pinList[i].Cid)
 		if err == nil {
-			t.Errorf("expected error re-unpinning %s: %s", pinList[i].Cid, err)
+			t.Errorf("expected error re-unpinning %s", pinList[i].Cid)
 		}
 	}
 
 	delay()
 	funpinned := func(t *testing.T, c *Cluster) {
-		status := c.tracker.StatusAll()
+		status := c.tracker.StatusAll(ctx)
 		for _, v := range status {
 			t.Errorf("%s should have been unpinned but it is %s", v.Cid, v.Status)
 		}
@@ -496,21 +647,22 @@ func TestClustersPin(t *testing.T) {
 }
 
 func TestClustersStatusAll(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 	// Global status
 	f := func(t *testing.T, c *Cluster) {
-		statuses, err := c.StatusAll()
+		statuses, err := c.StatusAll(ctx)
 		if err != nil {
 			t.Error(err)
 		}
 		if len(statuses) != 1 {
 			t.Fatal("bad status. Expected one item")
 		}
-		if statuses[0].Cid.String() != test.TestCid1 {
+		if !statuses[0].Cid.Equals(h) {
 			t.Error("bad cid in status")
 		}
 		info := statuses[0].PeerMap
@@ -518,21 +670,23 @@ func TestClustersStatusAll(t *testing.T) {
 			t.Error("bad info in status")
 		}
 
-		if info[c.host.ID()].Status != api.TrackerStatusPinned {
+		pid := peer.IDB58Encode(c.host.ID())
+		if info[pid].Status != api.TrackerStatusPinned {
 			t.Error("the hash should have been pinned")
 		}
 
-		status, err := c.Status(h)
+		status, err := c.Status(ctx, h)
 		if err != nil {
 			t.Error(err)
 		}
 
-		pinfo, ok := status.PeerMap[c.host.ID()]
+		pinfo, ok := status.PeerMap[pid]
 		if !ok {
 			t.Fatal("Host not in status")
 		}
 
 		if pinfo.Status != api.TrackerStatusPinned {
+			t.Error(pinfo.Error)
 			t.Error("the status should show the hash as pinned")
 		}
 	}
@@ -540,23 +694,24 @@ func TestClustersStatusAll(t *testing.T) {
 }
 
 func TestClustersStatusAllWithErrors(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 
 	// shutdown 1 cluster peer
-	clusters[1].Shutdown()
+	clusters[1].Shutdown(ctx)
 	delay()
 
 	f := func(t *testing.T, c *Cluster) {
 		// skip if it's the shutdown peer
-		if c.ID().ID == clusters[1].ID().ID {
+		if c.ID(ctx).ID == clusters[1].ID(ctx).ID {
 			return
 		}
 
-		statuses, err := c.StatusAll()
+		statuses, err := c.StatusAll(ctx)
 		if err != nil {
 			t.Error(err)
 		}
@@ -564,35 +719,53 @@ func TestClustersStatusAllWithErrors(t *testing.T) {
 			t.Fatal("bad status. Expected one item")
 		}
 
-		stts := statuses[0]
-		if len(stts.PeerMap) != nClusters {
-			t.Error("bad number of peers in status")
-		}
+		// Raft and CRDT behave differently here
+		switch consensus {
+		case "raft":
+			// Raft will have all statuses with one of them
+			// being in ERROR because the peer is off
 
-		errst := stts.PeerMap[clusters[1].ID().ID]
+			stts := statuses[0]
+			if len(stts.PeerMap) != nClusters {
+				t.Error("bad number of peers in status")
+			}
 
-		if errst.Cid.String() != test.TestCid1 {
-			t.Error("errored pinInfo should have a good cid")
-		}
+			pid := peer.IDB58Encode(clusters[1].id)
+			errst := stts.PeerMap[pid]
 
-		if errst.Status != api.TrackerStatusClusterError {
-			t.Error("erroring status should be set to ClusterError")
-		}
+			if !errst.Cid.Equals(h) {
+				t.Error("errored pinInfo should have a good cid")
+			}
 
-		// now check with Cid status
-		status, err := c.Status(h)
-		if err != nil {
-			t.Error(err)
-		}
+			if errst.Status != api.TrackerStatusClusterError {
+				t.Error("erroring status should be set to ClusterError")
+			}
 
-		pinfo := status.PeerMap[clusters[1].ID().ID]
+			// now check with Cid status
+			status, err := c.Status(ctx, h)
+			if err != nil {
+				t.Error(err)
+			}
 
-		if pinfo.Status != api.TrackerStatusClusterError {
-			t.Error("erroring status should be ClusterError")
-		}
+			pinfo := status.PeerMap[pid]
 
-		if pinfo.Cid.String() != test.TestCid1 {
-			t.Error("errored status should have a good cid")
+			if pinfo.Status != api.TrackerStatusClusterError {
+				t.Error("erroring status should be ClusterError")
+			}
+
+			if !pinfo.Cid.Equals(h) {
+				t.Error("errored status should have a good cid")
+			}
+		case "crdt":
+			// CRDT will not have contacted the offline peer because
+			// its metric expired and therefore is not in the
+			// peerset.
+			if len(statuses[0].PeerMap) != nClusters-1 {
+				t.Error("expected a different number of statuses")
+			}
+		default:
+			t.Fatal("bad consensus")
+
 		}
 
 	}
@@ -600,18 +773,17 @@ func TestClustersStatusAllWithErrors(t *testing.T) {
 }
 
 func TestClustersSyncAllLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(test.ErrorCid)) // This cid always fails
+	clusters[0].Pin(ctx, api.PinCid(test.Cid2))
 	pinDelay()
 	pinDelay()
 
 	f := func(t *testing.T, c *Cluster) {
 		// Sync bad ID
-		infos, err := c.SyncAllLocal()
+		infos, err := c.SyncAllLocal(ctx)
 		if err != nil {
 			// LocalSync() is asynchronous and should not show an
 			// error even if Recover() fails.
@@ -630,17 +802,18 @@ func TestClustersSyncAllLocal(t *testing.T) {
 }
 
 func TestClustersSyncLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	h := test.ErrorCid
+	h2 := test.Cid2
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
 	f := func(t *testing.T, c *Cluster) {
-		info, err := c.SyncLocal(h)
+		info, err := c.SyncLocal(ctx, h)
 		if err != nil {
 			t.Error(err)
 		}
@@ -649,7 +822,7 @@ func TestClustersSyncLocal(t *testing.T) {
 		}
 
 		// Sync good ID
-		info, err = c.SyncLocal(h2)
+		info, err = c.SyncLocal(ctx, h2)
 		if err != nil {
 			t.Error(err)
 		}
@@ -662,28 +835,27 @@ func TestClustersSyncLocal(t *testing.T) {
 }
 
 func TestClustersSyncAll(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(test.ErrorCid))
+	clusters[0].Pin(ctx, api.PinCid(test.Cid2))
 	pinDelay()
 	pinDelay()
 
 	j := rand.Intn(nClusters) // choose a random cluster peer
-	ginfos, err := clusters[j].SyncAll()
+	ginfos, err := clusters[j].SyncAll(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ginfos) != 1 {
 		t.Fatalf("expected globalsync to have 1 elements, got = %d", len(ginfos))
 	}
-	if ginfos[0].Cid.String() != test.ErrorCid {
+	if !ginfos[0].Cid.Equals(test.ErrorCid) {
 		t.Error("expected globalsync to have problems with test.ErrorCid")
 	}
 	for _, c := range clusters {
-		inf, ok := ginfos[0].PeerMap[c.host.ID()]
+		inf, ok := ginfos[0].PeerMap[peer.IDB58Encode(c.host.ID())]
 		if !ok {
 			t.Fatal("GlobalPinInfo should have this cluster")
 		}
@@ -694,23 +866,24 @@ func TestClustersSyncAll(t *testing.T) {
 }
 
 func TestClustersSync(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	h := test.ErrorCid // This cid always fails
+	h2 := test.Cid2
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
 	j := rand.Intn(nClusters)
-	ginfo, err := clusters[j].Sync(h)
+	ginfo, err := clusters[j].Sync(ctx, h)
 	if err != nil {
 		// we always attempt to return a valid response
 		// with errors contained in GlobalPinInfo
 		t.Fatal("did not expect an error")
 	}
-	pinfo, ok := ginfo.PeerMap[clusters[j].host.ID()]
+	pinfo, ok := ginfo.PeerMap[peer.IDB58Encode(clusters[j].host.ID())]
 	if !ok {
 		t.Fatal("should have info for this host")
 	}
@@ -718,12 +891,12 @@ func TestClustersSync(t *testing.T) {
 		t.Error("pinInfo error should not be empty")
 	}
 
-	if ginfo.Cid.String() != test.ErrorCid {
+	if !ginfo.Cid.Equals(h) {
 		t.Error("GlobalPinInfo should be for test.ErrorCid")
 	}
 
 	for _, c := range clusters {
-		inf, ok := ginfo.PeerMap[c.host.ID()]
+		inf, ok := ginfo.PeerMap[peer.IDB58Encode(c.host.ID())]
 		if !ok {
 			t.Logf("%+v", ginfo)
 			t.Fatal("GlobalPinInfo should not be empty for this host")
@@ -736,16 +909,16 @@ func TestClustersSync(t *testing.T) {
 
 	// Test with a good Cid
 	j = rand.Intn(nClusters)
-	ginfo, err = clusters[j].Sync(h2)
+	ginfo, err = clusters[j].Sync(ctx, h2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ginfo.Cid.String() != test.TestCid2 {
+	if !ginfo.Cid.Equals(h2) {
 		t.Error("GlobalPinInfo should be for testrCid2")
 	}
 
 	for _, c := range clusters {
-		inf, ok := ginfo.PeerMap[c.host.ID()]
+		inf, ok := ginfo.PeerMap[peer.IDB58Encode(c.host.ID())]
 		if !ok {
 			t.Fatal("GlobalPinInfo should have this cluster")
 		}
@@ -756,33 +929,34 @@ func TestClustersSync(t *testing.T) {
 }
 
 func TestClustersRecoverLocal(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
+	h := test.ErrorCid // This cid always fails
+	h2 := test.Cid2
 
 	ttlDelay()
 
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 	pinDelay()
 	pinDelay()
 
 	f := func(t *testing.T, c *Cluster) {
-		info, err := c.RecoverLocal(h)
+		info, err := c.RecoverLocal(ctx, h)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Wait for queue to be processed
 		delay()
 
-		info = c.StatusLocal(h)
+		info = c.StatusLocal(ctx, h)
 		if info.Status != api.TrackerStatusPinError {
 			t.Errorf("element is %s and not PinError", info.Status)
 		}
 
 		// Recover good ID
-		info, err = c.SyncLocal(h2)
+		info, err = c.SyncLocal(ctx, h2)
 		if err != nil {
 			t.Error(err)
 		}
@@ -795,21 +969,22 @@ func TestClustersRecoverLocal(t *testing.T) {
 }
 
 func TestClustersRecover(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
-	h, _ := cid.Decode(test.ErrorCid) // This cid always fails
-	h2, _ := cid.Decode(test.TestCid2)
+	h := test.ErrorCid // This cid always fails
+	h2 := test.Cid2
 
 	ttlDelay()
 
-	clusters[0].Pin(api.PinCid(h))
-	clusters[0].Pin(api.PinCid(h2))
+	clusters[0].Pin(ctx, api.PinCid(h))
+	clusters[0].Pin(ctx, api.PinCid(h2))
 
 	pinDelay()
 	pinDelay()
 
 	j := rand.Intn(nClusters)
-	_, err := clusters[j].Recover(h)
+	_, err := clusters[j].Recover(ctx, h)
 	if err != nil {
 		// we always attempt to return a valid response
 		// with errors contained in GlobalPinInfo
@@ -819,12 +994,12 @@ func TestClustersRecover(t *testing.T) {
 	// Wait for queue to be processed
 	delay()
 
-	ginfo, err := clusters[j].Status(h)
+	ginfo, err := clusters[j].Status(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pinfo, ok := ginfo.PeerMap[clusters[j].host.ID()]
+	pinfo, ok := ginfo.PeerMap[peer.IDB58Encode(clusters[j].host.ID())]
 	if !ok {
 		t.Fatal("should have info for this host")
 	}
@@ -833,7 +1008,7 @@ func TestClustersRecover(t *testing.T) {
 	}
 
 	for _, c := range clusters {
-		inf, ok := ginfo.PeerMap[c.host.ID()]
+		inf, ok := ginfo.PeerMap[peer.IDB58Encode(c.host.ID())]
 		if !ok {
 			t.Fatal("GlobalPinInfo should not be empty for this host")
 		}
@@ -846,16 +1021,16 @@ func TestClustersRecover(t *testing.T) {
 
 	// Test with a good Cid
 	j = rand.Intn(nClusters)
-	ginfo, err = clusters[j].Recover(h2)
+	ginfo, err = clusters[j].Recover(ctx, h2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ginfo.Cid.String() != test.TestCid2 {
+	if !ginfo.Cid.Equals(h2) {
 		t.Error("GlobalPinInfo should be for testrCid2")
 	}
 
 	for _, c := range clusters {
-		inf, ok := ginfo.PeerMap[c.host.ID()]
+		inf, ok := ginfo.PeerMap[peer.IDB58Encode(c.host.ID())]
 		if !ok {
 			t.Fatal("GlobalPinInfo should have this cluster")
 		}
@@ -866,11 +1041,12 @@ func TestClustersRecover(t *testing.T) {
 }
 
 func TestClustersShutdown(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 
 	f := func(t *testing.T, c *Cluster) {
-		err := c.Shutdown()
+		err := c.Shutdown(ctx)
 		if err != nil {
 			t.Error("should be able to shutdown cleanly")
 		}
@@ -881,7 +1057,8 @@ func TestClustersShutdown(t *testing.T) {
 	runF(t, clusters, f)
 }
 
-func TestClustersReplication(t *testing.T) {
+func TestClustersReplicationOverall(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -889,30 +1066,27 @@ func TestClustersReplication(t *testing.T) {
 		c.config.ReplicationFactorMax = nClusters - 1
 	}
 
-	ttlDelay()
-
 	// Why is replication factor nClusters - 1?
 	// Because that way we know that pinning nCluster
 	// pins with an strategy like numpins/disk
 	// will result in each peer holding locally exactly
 	// nCluster pins.
 
-	tmpCid, _ := cid.Decode(test.TestCid1)
-	prefix := tmpCid.Prefix()
+	prefix := test.Cid1.Prefix()
 
 	for i := 0; i < nClusters; i++ {
 		// Pick a random cluster and hash
 		j := rand.Intn(nClusters)           // choose a random cluster peer
 		h, err := prefix.Sum(randomBytes()) // create random cid
 		checkErr(t, err)
-		err = clusters[j].Pin(api.PinCid(h))
+		err = clusters[j].Pin(ctx, api.PinCid(h))
 		if err != nil {
 			t.Error(err)
 		}
 		pinDelay()
 
-		// check that it is held by exactly nClusters -1 peers
-		gpi, err := clusters[j].Status(h)
+		// check that it is held by exactly nClusters - 1 peers
+		gpi, err := clusters[j].Status(ctx, h)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -927,8 +1101,11 @@ func TestClustersReplication(t *testing.T) {
 			}
 		}
 		if numLocal != nClusters-1 {
-			t.Errorf("We wanted replication %d but it's only %d",
-				nClusters-1, numLocal)
+			t.Errorf(
+				"We wanted replication %d but it's only %d",
+				nClusters-1,
+				numLocal,
+			)
 		}
 
 		if numRemote != 1 {
@@ -938,10 +1115,12 @@ func TestClustersReplication(t *testing.T) {
 	}
 
 	f := func(t *testing.T, c *Cluster) {
-		pinfos := c.tracker.StatusAll()
+		// confirm that the pintracker state matches the current global state
+		pinfos := c.tracker.StatusAll(ctx)
 		if len(pinfos) != nClusters {
 			t.Error("Pinfos does not have the expected pins")
 		}
+
 		numRemote := 0
 		numLocal := 0
 		for _, pi := range pinfos {
@@ -954,15 +1133,17 @@ func TestClustersReplication(t *testing.T) {
 			}
 		}
 		if numLocal != nClusters-1 {
-			t.Errorf("Expected %d local pins but got %d", nClusters-1, numLocal)
-			t.Error(pinfos)
+			t.Errorf("%s: Expected %d local pins but got %d", c.id.String(), nClusters-1, numLocal)
 		}
 
 		if numRemote != 1 {
-			t.Errorf("Expected 1 remote pin but got %d", numRemote)
+			t.Errorf("%s: Expected 1 remote pin but got %d", c.id.String(), numRemote)
 		}
 
-		pins := c.Pins()
+		pins, err := c.Pins(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, pin := range pins {
 			allocs := pin.Allocations
 			if len(allocs) != nClusters-1 {
@@ -970,7 +1151,7 @@ func TestClustersReplication(t *testing.T) {
 			}
 			for _, a := range allocs {
 				if a == c.id {
-					pinfo := c.tracker.Status(pin.Cid)
+					pinfo := c.tracker.Status(ctx, pin.Cid)
 					if pinfo.Status != api.TrackerStatusPinned {
 						t.Errorf("Peer %s was allocated but it is not pinning cid", c.id)
 					}
@@ -985,6 +1166,7 @@ func TestClustersReplication(t *testing.T) {
 // This test checks that we pin with ReplicationFactorMax when
 // we can
 func TestClustersReplicationFactorMax(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 3 {
 		t.Skip("Need at least 3 peers")
 	}
@@ -998,8 +1180,8 @@ func TestClustersReplicationFactorMax(t *testing.T) {
 
 	ttlDelay()
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1007,7 +1189,7 @@ func TestClustersReplicationFactorMax(t *testing.T) {
 	pinDelay()
 
 	f := func(t *testing.T, c *Cluster) {
-		p, err := c.PinGet(h)
+		p, err := c.PinGet(ctx, h)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1030,6 +1212,7 @@ func TestClustersReplicationFactorMax(t *testing.T) {
 // This tests checks that repinning something that is overpinned
 // removes some allocations
 func TestClustersReplicationFactorMaxLower(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1043,15 +1226,15 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 
 	ttlDelay() // make sure we have places to pin
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	p1, err := clusters[0].PinGet(h)
+	p1, err := clusters[0].PinGet(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,14 +1246,14 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 	pin := api.PinCid(h)
 	pin.ReplicationFactorMin = 1
 	pin.ReplicationFactorMax = 2
-	err = clusters[0].Pin(pin)
+	err = clusters[0].Pin(ctx, pin)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	p2, err := clusters[0].PinGet(h)
+	p2, err := clusters[0].PinGet(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,6 +1266,7 @@ func TestClustersReplicationFactorMaxLower(t *testing.T) {
 // This test checks that when not all nodes are available,
 // we pin in as many as we can aiming for ReplicationFactorMax
 func TestClustersReplicationFactorInBetween(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1097,13 +1281,13 @@ func TestClustersReplicationFactorInBetween(t *testing.T) {
 	ttlDelay()
 
 	// Shutdown two peers
-	clusters[nClusters-1].Shutdown()
-	clusters[nClusters-2].Shutdown()
+	clusters[nClusters-1].Shutdown(ctx)
+	clusters[nClusters-2].Shutdown(ctx)
 
 	waitForLeaderAndMetrics(t, clusters)
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1114,7 +1298,7 @@ func TestClustersReplicationFactorInBetween(t *testing.T) {
 		if c == clusters[nClusters-1] || c == clusters[nClusters-2] {
 			return
 		}
-		p, err := c.PinGet(h)
+		p, err := c.PinGet(ctx, h)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1137,6 +1321,7 @@ func TestClustersReplicationFactorInBetween(t *testing.T) {
 // This test checks that we do not pin something for which
 // we cannot reach ReplicationFactorMin
 func TestClustersReplicationFactorMin(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1149,13 +1334,13 @@ func TestClustersReplicationFactorMin(t *testing.T) {
 	}
 
 	// Shutdown two peers
-	clusters[nClusters-1].Shutdown()
+	clusters[nClusters-1].Shutdown(ctx)
 	waitForLeaderAndMetrics(t, clusters)
-	clusters[nClusters-2].Shutdown()
+	clusters[nClusters-2].Shutdown(ctx)
 	waitForLeaderAndMetrics(t, clusters)
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err == nil {
 		t.Error("Pin should have failed as rplMin cannot be satisfied")
 	}
@@ -1168,6 +1353,7 @@ func TestClustersReplicationFactorMin(t *testing.T) {
 // This tests checks that repinning something that has becomed
 // underpinned actually changes nothing if it's sufficiently pinned
 func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1181,8 +1367,8 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 
 	ttlDelay()
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1190,19 +1376,19 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 	pinDelay()
 
 	// Shutdown two peers
-	clusters[nClusters-1].Shutdown()
+	clusters[nClusters-1].Shutdown(ctx)
 	waitForLeaderAndMetrics(t, clusters)
-	clusters[nClusters-2].Shutdown()
+	clusters[nClusters-2].Shutdown(ctx)
 	waitForLeaderAndMetrics(t, clusters)
 
-	err = clusters[0].Pin(api.PinCid(h))
+	err = clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	p, err := clusters[0].PinGet(h)
+	p, err := clusters[0].PinGet(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1220,6 +1406,7 @@ func TestClustersReplicationMinMaxNoRealloc(t *testing.T) {
 // underpinned does re-allocations when it's not sufficiently
 // pinned anymore
 func TestClustersReplicationMinMaxRealloc(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1233,15 +1420,15 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 
 	ttlDelay() // make sure metrics are in
 
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[0].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	p, err := clusters[0].PinGet(h)
+	p, err := clusters[0].PinGet(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1258,20 +1445,20 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 	alloc2 := peerIDMap[firstAllocations[1]]
 	safePeer := peerIDMap[firstAllocations[2]]
 
-	alloc1.Shutdown()
-	alloc2.Shutdown()
+	alloc1.Shutdown(ctx)
+	alloc2.Shutdown(ctx)
 
 	waitForLeaderAndMetrics(t, clusters)
 
 	// Repin - (although this might have been taken of if there was an alert
-	err = safePeer.Pin(api.PinCid(h))
+	err = safePeer.Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	p, err = safePeer.PinGet(h)
+	p, err = safePeer.PinGet(ctx, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1303,6 +1490,7 @@ func TestClustersReplicationMinMaxRealloc(t *testing.T) {
 // In this test we check that repinning something
 // when a node has gone down will re-assign the pin
 func TestClustersReplicationRealloc(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -1313,8 +1501,8 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	ttlDelay()
 
 	j := rand.Intn(nClusters)
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1322,24 +1510,30 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	// Let the pin arrive
 	pinDelay()
 
-	pin := clusters[j].Pins()[0]
-	pinSerial := pin.ToSerial()
-	allocs := sort.StringSlice(pinSerial.Allocations)
+	pinList, err := clusters[j].Pins(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := pinList[0]
+	allocs := sort.StringSlice(api.PeersToStrings(pin.Allocations))
 	allocs.Sort()
 	allocsStr := fmt.Sprintf("%s", allocs)
 
 	// Re-pin should work and be allocated to the same
 	// nodes
-	err = clusters[j].Pin(api.PinCid(h))
+	err = clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	pinDelay()
 
-	pin2 := clusters[j].Pins()[0]
-	pinSerial2 := pin2.ToSerial()
-	allocs2 := sort.StringSlice(pinSerial2.Allocations)
+	pinList2, err := clusters[j].Pins(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin2 := pinList2[0]
+	allocs2 := sort.StringSlice(api.PeersToStrings(pin2.Allocations))
 	allocs2.Sort()
 	allocsStr2 := fmt.Sprintf("%s", allocs2)
 	if allocsStr != allocsStr2 {
@@ -1351,12 +1545,12 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	var killedClusterIndex int
 	// find someone that pinned it and kill that cluster
 	for i, c := range clusters {
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Logf("Killing %s", c.id.Pretty())
 			killedClusterIndex = i
-			t.Logf("Shutting down %s", c.ID().ID)
-			c.Shutdown()
+			t.Logf("Shutting down %s", c.ID(ctx).ID)
+			c.Shutdown(ctx)
 			break
 		}
 	}
@@ -1372,7 +1566,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 	}
 
 	// now pin should succeed
-	err = clusters[j].Pin(api.PinCid(h))
+	err = clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1384,7 +1578,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 		if i == killedClusterIndex {
 			continue
 		}
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Log(pinfo.Peer.Pretty())
 			numPinned++
@@ -1400,6 +1594,7 @@ func TestClustersReplicationRealloc(t *testing.T) {
 // as many available peers a we need. It's like before, except
 // more peers are killed.
 func TestClustersReplicationNotEnoughPeers(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
 	}
@@ -1410,9 +1605,11 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 		c.config.ReplicationFactorMax = nClusters - 1
 	}
 
+	ttlDelay()
+
 	j := rand.Intn(nClusters)
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1420,12 +1617,12 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 	// Let the pin arrive
 	pinDelay()
 
-	clusters[0].Shutdown()
-	clusters[1].Shutdown()
+	clusters[0].Shutdown(ctx)
+	clusters[1].Shutdown(ctx)
 
 	waitForLeaderAndMetrics(t, clusters)
 
-	err = clusters[2].Pin(api.PinCid(h))
+	err = clusters[2].Pin(ctx, api.PinCid(h))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -1437,8 +1634,14 @@ func TestClustersReplicationNotEnoughPeers(t *testing.T) {
 }
 
 func TestClustersRebalanceOnPeerDown(t *testing.T) {
+	ctx := context.Background()
 	if nClusters < 5 {
 		t.Skip("Need at least 5 peers")
+	}
+
+	if consensus == "crdt" {
+		t.Log("FIXME when re-alloc changes come through")
+		return
 	}
 
 	clusters, mock := createClusters(t)
@@ -1449,16 +1652,16 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 	}
 
 	// pin something
-	h, _ := cid.Decode(test.TestCid1)
-	clusters[0].Pin(api.PinCid(h))
+	h := test.Cid1
+	clusters[0].Pin(ctx, api.PinCid(h))
 	pinDelay()
 	pinLocal := 0
 	pinRemote := 0
-	var localPinner peer.ID
-	var remotePinner peer.ID
+	var localPinner string
+	var remotePinner string
 	var remotePinnerCluster *Cluster
 
-	status, _ := clusters[0].Status(h)
+	status, _ := clusters[0].Status(ctx, h)
 
 	// check it was correctly pinned
 	for p, pinfo := range status.PeerMap {
@@ -1477,9 +1680,10 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 
 	// kill the local pinner
 	for _, c := range clusters {
-		if c.id == localPinner {
-			c.Shutdown()
-		} else if c.id == remotePinner {
+		clid := peer.IDB58Encode(c.id)
+		if clid == localPinner {
+			c.Shutdown(ctx)
+		} else if clid == remotePinner {
 			remotePinnerCluster = c
 		}
 	}
@@ -1488,7 +1692,7 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 	waitForLeaderAndMetrics(t, clusters) // in case we killed the leader
 
 	// It should be now pinned in the remote pinner
-	if s := remotePinnerCluster.tracker.Status(h).Status; s != api.TrackerStatusPinned {
+	if s := remotePinnerCluster.tracker.Status(ctx, h).Status; s != api.TrackerStatusPinned {
 		t.Errorf("it should be pinned and is %s", s)
 	}
 }
@@ -1497,7 +1701,7 @@ func TestClustersRebalanceOnPeerDown(t *testing.T) {
 // peers in clusterIDs are fully connected to each other and the expected ipfs
 // mock connectivity exists.  Cluster peers not in clusterIDs are assumed to
 // be disconnected and the graph should reflect this
-func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[peer.ID]struct{}) {
+func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[string]struct{}, peerNum int) {
 	// Check that all cluster peers see each other as peers
 	for id1, peers := range graph.ClusterLinks {
 		if _, ok := clusterIDs[id1]; !ok {
@@ -1506,14 +1710,14 @@ func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[p
 			}
 			continue
 		}
-		fmt.Printf("id: %s, peers: %v\n", id1, peers)
+		t.Logf("id: %s, peers: %v\n", id1, peers)
 		if len(peers) > len(clusterIDs)-1 {
 			t.Errorf("More peers recorded in graph than expected")
 		}
 		// Make lookup index for peers connected to id1
-		peerIndex := make(map[peer.ID]struct{})
-		for _, peer := range peers {
-			peerIndex[peer] = struct{}{}
+		peerIndex := make(map[string]struct{})
+		for _, p := range peers {
+			peerIndex[peer.IDB58Encode(p)] = struct{}{}
 		}
 		for id2 := range clusterIDs {
 			if _, ok := peerIndex[id2]; id1 != id2 && !ok {
@@ -1521,7 +1725,7 @@ func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[p
 			}
 		}
 	}
-	if len(graph.ClusterLinks) != nClusters {
+	if len(graph.ClusterLinks) != peerNum {
 		t.Errorf("Unexpected number of cluster nodes in graph")
 	}
 
@@ -1536,12 +1740,12 @@ func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[p
 	if len(graph.IPFSLinks) != 1 {
 		t.Error("Expected exactly one ipfs peer for all cluster nodes, the mocked peer")
 	}
-	links, ok := graph.IPFSLinks[test.TestPeerID1]
+	links, ok := graph.IPFSLinks[peer.IDB58Encode(test.PeerID1)]
 	if !ok {
 		t.Error("Expected the mocked ipfs peer to be a node in the graph")
 	} else {
-		if len(links) != 2 || links[0] != test.TestPeerID4 ||
-			links[1] != test.TestPeerID5 {
+		if len(links) != 2 || links[0] != test.PeerID4 ||
+			links[1] != test.PeerID5 {
 			t.Error("Swarm peers of mocked ipfs are not those expected")
 		}
 	}
@@ -1551,7 +1755,7 @@ func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[p
 		if ipfsID, ok := graph.ClustertoIPFS[id]; !ok {
 			t.Errorf("Expected graph to record peer %s's ipfs connection", id)
 		} else {
-			if ipfsID != test.TestPeerID1 {
+			if ipfsID != test.PeerID1 {
 				t.Errorf("Unexpected error %s", ipfsID)
 			}
 		}
@@ -1564,8 +1768,11 @@ func validateClusterGraph(t *testing.T, graph api.ConnectGraph, clusterIDs map[p
 // In this test we get a cluster graph report from a random peer in a healthy
 // fully connected cluster and verify that it is formed as expected.
 func TestClustersGraphConnected(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
+
+	ttlDelay()
 
 	j := rand.Intn(nClusters) // choose a random cluster peer to query
 	graph, err := clusters[j].ConnectGraph()
@@ -1573,18 +1780,19 @@ func TestClustersGraphConnected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clusterIDs := make(map[peer.ID]struct{})
+	clusterIDs := make(map[string]struct{})
 	for _, c := range clusters {
-		id := c.ID().ID
+		id := peer.IDB58Encode(c.ID(ctx).ID)
 		clusterIDs[id] = struct{}{}
 	}
-	validateClusterGraph(t, graph, clusterIDs)
+	validateClusterGraph(t, graph, clusterIDs, nClusters)
 }
 
 // Similar to the previous test we get a cluster graph report from a peer.
 // However now 2 peers have been shutdown and so we do not expect to see
 // them in the graph
 func TestClustersGraphUnhealthy(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	if nClusters < 5 {
@@ -1606,8 +1814,8 @@ func TestClustersGraphUnhealthy(t *testing.T) {
 		}
 	}
 
-	clusters[discon1].Shutdown()
-	clusters[discon2].Shutdown()
+	clusters[discon1].Shutdown(ctx)
+	clusters[discon2].Shutdown(ctx)
 
 	waitForLeaderAndMetrics(t, clusters)
 
@@ -1616,20 +1824,27 @@ func TestClustersGraphUnhealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clusterIDs := make(map[peer.ID]struct{})
+	clusterIDs := make(map[string]struct{})
 	for i, c := range clusters {
 		if i == discon1 || i == discon2 {
 			continue
 		}
-		id := c.ID().ID
+		id := peer.IDB58Encode(c.ID(ctx).ID)
 		clusterIDs[id] = struct{}{}
 	}
-	validateClusterGraph(t, graph, clusterIDs)
+	peerNum := nClusters
+	switch consensus {
+	case "crdt":
+		peerNum = nClusters - 2
+	}
+
+	validateClusterGraph(t, graph, clusterIDs, peerNum)
 }
 
 // Check that the pin is not re-assigned when a node
 // that has disabled repinning goes down.
 func TestClustersDisabledRepinning(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	for _, c := range clusters {
@@ -1641,8 +1856,8 @@ func TestClustersDisabledRepinning(t *testing.T) {
 	ttlDelay()
 
 	j := rand.Intn(nClusters)
-	h, _ := cid.Decode(test.TestCid1)
-	err := clusters[j].Pin(api.PinCid(h))
+	h := test.Cid1
+	err := clusters[j].Pin(ctx, api.PinCid(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1653,11 +1868,11 @@ func TestClustersDisabledRepinning(t *testing.T) {
 	var killedClusterIndex int
 	// find someone that pinned it and kill that cluster
 	for i, c := range clusters {
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			killedClusterIndex = i
-			t.Logf("Shutting down %s", c.ID().ID)
-			c.Shutdown()
+			t.Logf("Shutting down %s", c.ID(ctx).ID)
+			c.Shutdown(ctx)
 			break
 		}
 	}
@@ -1677,7 +1892,7 @@ func TestClustersDisabledRepinning(t *testing.T) {
 		if i == killedClusterIndex {
 			continue
 		}
-		pinfo := c.tracker.Status(h)
+		pinfo := c.tracker.Status(ctx, h)
 		if pinfo.Status == api.TrackerStatusPinned {
 			//t.Log(pinfo.Peer.Pretty())
 			numPinned++

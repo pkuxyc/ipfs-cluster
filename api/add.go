@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+
+	cid "github.com/ipfs/go-cid"
 )
 
 // DefaultShardSize is the shard size for params objects created with DefaultParams().
@@ -13,10 +15,10 @@ var DefaultShardSize = uint64(100 * 1024 * 1024) // 100 MB
 // AddedOutput carries information for displaying the standard ipfs output
 // indicating a node of a file has been added.
 type AddedOutput struct {
-	Name  string `json:"name"`
-	Cid   string `json:"cid,omitempty"`
-	Bytes uint64 `json:"bytes,omitempty"`
-	Size  uint64 `json:"size,omitempty"`
+	Name  string  `json:"name" codec:"n,omitempty"`
+	Cid   cid.Cid `json:"cid" codec:"c"`
+	Bytes uint64  `json:"bytes,omitempty" codec:"b,omitempty"`
+	Size  uint64  `json:"size,omitempty" codec:"s,omitempty"`
 }
 
 // AddParams contains all of the configurable parameters needed to specify the
@@ -24,31 +26,35 @@ type AddedOutput struct {
 type AddParams struct {
 	PinOptions
 
-	Recursive  bool
-	Layout     string
-	Chunker    string
-	RawLeaves  bool
-	Hidden     bool
-	Wrap       bool
-	Shard      bool
-	Progress   bool
-	CidVersion int
-	HashFun    string
+	Recursive      bool
+	Layout         string
+	Chunker        string
+	RawLeaves      bool
+	Hidden         bool
+	Wrap           bool
+	Shard          bool
+	Progress       bool
+	CidVersion     int
+	HashFun        string
+	StreamChannels bool
+	NoCopy         bool
 }
 
 // DefaultAddParams returns a AddParams object with standard defaults
 func DefaultAddParams() *AddParams {
 	return &AddParams{
-		Recursive:  false,
-		Layout:     "", // corresponds to balanced layout
-		Chunker:    "size-262144",
-		RawLeaves:  false,
-		Hidden:     false,
-		Wrap:       false,
-		Shard:      false,
-		Progress:   false,
-		CidVersion: 0,
-		HashFun:    "sha2-256",
+		Recursive:      false,
+		Layout:         "", // corresponds to balanced layout
+		Chunker:        "size-262144",
+		RawLeaves:      false,
+		Hidden:         false,
+		Wrap:           false,
+		Shard:          false,
+		Progress:       false,
+		CidVersion:     0,
+		HashFun:        "sha2-256",
+		StreamChannels: true,
+		NoCopy:         false,
 		PinOptions: PinOptions{
 			ReplicationFactorMin: 0,
 			ReplicationFactorMax: 0,
@@ -90,7 +96,7 @@ func AddParamsFromQuery(query url.Values) (*AddParams, error) {
 	case "trickle", "balanced", "":
 		// nothing
 	default:
-		return nil, errors.New("parameter trickle invalid")
+		return nil, errors.New("layout parameter invalid")
 	}
 	params.Layout = layout
 
@@ -153,6 +159,16 @@ func AddParamsFromQuery(query url.Values) (*AddParams, error) {
 		params.ShardSize = shardSize
 	}
 
+	err = parseBoolParam(query, "stream-channels", &params.StreamChannels)
+	if err != nil {
+		return nil, err
+	}
+
+	err = parseBoolParam(query, "nocopy", &params.NoCopy)
+	if err != nil {
+		return nil, err
+	}
+
 	return params, nil
 }
 
@@ -173,6 +189,8 @@ func (p *AddParams) ToQueryString() string {
 	query.Set("progress", fmt.Sprintf("%t", p.Progress))
 	query.Set("cid-version", fmt.Sprintf("%d", p.CidVersion))
 	query.Set("hash", p.HashFun)
+	query.Set("stream-channels", fmt.Sprintf("%t", p.StreamChannels))
+	query.Set("nocopy", fmt.Sprintf("%t", p.NoCopy))
 	return query.Encode()
 }
 
@@ -190,5 +208,7 @@ func (p *AddParams) Equals(p2 *AddParams) bool {
 		p.Hidden == p2.Hidden &&
 		p.Wrap == p2.Wrap &&
 		p.CidVersion == p2.CidVersion &&
-		p.HashFun == p2.HashFun
+		p.HashFun == p2.HashFun &&
+		p.StreamChannels == p2.StreamChannels &&
+		p.NoCopy == p2.NoCopy
 }

@@ -33,7 +33,7 @@ type DAGService struct {
 }
 
 // New returns a new Adder with the given rpc Client. The client is used
-// to perform calls to IPFSBlockPut and Pin content on Cluster.
+// to perform calls to IPFS.BlockPut and Pin content on Cluster.
 func New(rpc *rpc.Client, opts api.PinOptions) *DAGService {
 	return &DAGService{
 		rpcClient: rpc,
@@ -57,7 +57,7 @@ func (dgs *DAGService) Add(ctx context.Context, node ipld.Node) error {
 		return err
 	}
 	nodeSerial := &api.NodeWithMeta{
-		Cid:     node.Cid().String(),
+		Cid:     node.Cid(),
 		Data:    node.RawData(),
 		CumSize: size,
 	}
@@ -78,7 +78,7 @@ func (dgs *DAGService) Finalize(ctx context.Context, root cid.Cid) (cid.Cid, err
 		"",
 		"Cluster",
 		"Pin",
-		rootPin.ToSerial(),
+		rootPin,
 		&struct{}{},
 	)
 }

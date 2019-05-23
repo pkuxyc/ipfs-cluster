@@ -3,6 +3,7 @@ package ipfsadd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	gopath "path"
@@ -101,11 +102,16 @@ func (adder *Adder) add(reader io.Reader) (ipld.Node, error) {
 		CidBuilder: adder.CidBuilder,
 	}
 
-	if adder.Trickle {
-		return trickle.Layout(params.New(chnk))
+	dbh, err := params.New(chnk)
+	if err != nil {
+		return nil, err
 	}
 
-	return balanced.Layout(params.New(chnk))
+	if adder.Trickle {
+		return trickle.Layout(dbh)
+	}
+
+	return balanced.Layout(dbh)
 }
 
 // RootNode returns the root node of the Added.
@@ -278,11 +284,12 @@ func (adder *Adder) addNode(node ipld.Node, path string) error {
 }
 
 // AddFile adds the given file while respecting the adder.
-func (adder *Adder) AddFile(file files.File) error {
-	return adder.addFile(file)
+func (adder *Adder) AddFile(path string, file files.Node) error {
+	return adder.addFile(path, file)
 }
 
-func (adder *Adder) addFile(file files.File) error {
+func (adder *Adder) addFile(path string, nd files.Node) error {
+	defer nd.Close()
 	if adder.liveNodes >= liveCacheSize {
 		// TODO: A smarter cache that uses some sort of lru cache with an eviction handler
 		mr, err := adder.mfsRoot()
@@ -297,12 +304,12 @@ func (adder *Adder) addFile(file files.File) error {
 	}
 	adder.liveNodes++
 
-	if file.IsDirectory() {
-		return adder.addDir(file)
+	if dir := files.ToDir(nd); dir != nil {
+		return adder.addDir(path, dir)
 	}
 
 	// case for symlink
-	if s, ok := file.(*files.Symlink); ok {
+	if s := files.ToSymlink(nd); s != nil {
 		sdata, err := unixfs.SymlinkData(s.Target)
 		if err != nil {
 			return err
@@ -315,7 +322,11 @@ func (adder *Adder) addFile(file files.File) error {
 			return err
 		}
 
-		return adder.addNode(dagnode, s.FileName())
+		return adder.addNode(dagnode, path)
+	}
+	file := files.ToFile(nd)
+	if file == nil {
+		return errors.New("expected a regular file")
 	}
 
 	// case for regular file
@@ -323,7 +334,7 @@ func (adder *Adder) addFile(file files.File) error {
 	// progress updates to the client (over the output channel)
 	var reader io.Reader = file
 	if adder.Progress {
-		rdr := &progressReader{file: file, out: adder.Out}
+		rdr := &progressReader{file: file, path: path, out: adder.Out}
 		if fi, ok := file.(files.FileInfo); ok {
 			reader = &progressReader2{rdr, fi}
 		} else {
@@ -337,17 +348,17 @@ func (adder *Adder) addFile(file files.File) error {
 	}
 
 	// patch it into the root
-	return adder.addNode(dagnode, file.FileName())
+	return adder.addNode(dagnode, path)
 }
 
-func (adder *Adder) addDir(dir files.File) error {
-	log.Infof("adding directory: %s", dir.FileName())
+func (adder *Adder) addDir(path string, dir files.Directory) error {
+	log.Infof("adding directory: %s", path)
 
 	mr, err := adder.mfsRoot()
 	if err != nil {
 		return err
 	}
-	err = mfs.Mkdir(mr, dir.FileName(), mfs.MkdirOpts{
+	err = mfs.Mkdir(mr, path, mfs.MkdirOpts{
 		Mkparents:  true,
 		Flush:      false,
 		CidBuilder: adder.CidBuilder,
@@ -356,27 +367,18 @@ func (adder *Adder) addDir(dir files.File) error {
 		return err
 	}
 
-	for {
-		file, err := dir.NextFile()
-		if err != nil && err != io.EOF {
-			return err
-		}
-		if file == nil {
-			break
-		}
-
-		// Skip hidden files when adding recursively, unless Hidden is enabled.
-		if files.IsHidden(file) && !adder.Hidden {
-			log.Infof("%s is hidden, skipping", file.FileName())
+	it := dir.Entries()
+	for it.Next() {
+		fpath := gopath.Join(path, it.Name())
+		if files.IsHidden(fpath, it.Node()) && !adder.Hidden {
+			log.Infof("%s is hidden, skipping", fpath)
 			continue
 		}
-		err = adder.addFile(file)
-		if err != nil {
+		if err := adder.addFile(fpath, it.Node()); err != nil {
 			return err
 		}
 	}
-
-	return nil
+	return it.Err()
 }
 
 // outputDagnode sends dagnode info over the output channel
@@ -391,7 +393,7 @@ func outputDagnode(out chan *api.AddedOutput, name string, dn ipld.Node) error {
 	}
 
 	out <- &api.AddedOutput{
-		Cid:  dn.Cid().String(),
+		Cid:  dn.Cid(),
 		Name: name,
 		Size: s,
 	}
@@ -400,7 +402,8 @@ func outputDagnode(out chan *api.AddedOutput, name string, dn ipld.Node) error {
 }
 
 type progressReader struct {
-	file         files.File
+	file         io.Reader
+	path         string
 	out          chan *api.AddedOutput
 	bytes        int64
 	lastProgress int64
@@ -413,7 +416,7 @@ func (i *progressReader) Read(p []byte) (int, error) {
 	if i.bytes-i.lastProgress >= progressReaderIncrement || err == io.EOF {
 		i.lastProgress = i.bytes
 		i.out <- &api.AddedOutput{
-			Name:  i.file.FileName(),
+			Name:  i.path,
 			Bytes: uint64(i.bytes),
 		}
 	}
@@ -424,4 +427,8 @@ func (i *progressReader) Read(p []byte) (int, error) {
 type progressReader2 struct {
 	*progressReader
 	files.FileInfo
+}
+
+func (i *progressReader2) Read(p []byte) (int, error) {
+	return i.progressReader.Read(p)
 }

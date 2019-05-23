@@ -32,11 +32,12 @@ func testClients(t *testing.T, api *rest.API, f func(*testing.T, Client)) {
 }
 
 func TestVersion(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		v, err := c.Version()
+		v, err := c.Version(ctx)
 		if err != nil || v.Version == "" {
 			t.Logf("%+v", v)
 			t.Log(err)
@@ -48,11 +49,12 @@ func TestVersion(t *testing.T) {
 }
 
 func TestID(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		id, err := c.ID()
+		id, err := c.ID(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -65,11 +67,12 @@ func TestID(t *testing.T) {
 }
 
 func TestPeers(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ids, err := c.Peers()
+		ids, err := c.Peers(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,17 +85,18 @@ func TestPeers(t *testing.T) {
 }
 
 func TestPeersWithError(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
 		addr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/44444")
 		c, _ = NewDefaultClient(&Config{APIAddr: addr, DisableKeepAlives: true})
-		ids, err := c.Peers()
+		ids, err := c.Peers(ctx)
 		if err == nil {
 			t.Fatal("expected error")
 		}
-		if ids == nil || len(ids) != 0 {
+		if ids != nil {
 			t.Fatal("expected no ids")
 		}
 	}
@@ -101,15 +105,16 @@ func TestPeersWithError(t *testing.T) {
 }
 
 func TestPeerAdd(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		id, err := c.PeerAdd(test.TestPeerID1)
+		id, err := c.PeerAdd(ctx, test.PeerID1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if id.ID != test.TestPeerID1 {
+		if id.ID != test.PeerID1 {
 			t.Error("bad peer")
 		}
 	}
@@ -118,11 +123,12 @@ func TestPeerAdd(t *testing.T) {
 }
 
 func TestPeerRm(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		err := c.PeerRm(test.TestPeerID1)
+		err := c.PeerRm(ctx, test.PeerID1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,12 +138,17 @@ func TestPeerRm(t *testing.T) {
 }
 
 func TestPin(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		err := c.Pin(ci, 6, 7, "hello there")
+		opts := types.PinOptions{
+			ReplicationFactorMin: 6,
+			ReplicationFactorMax: 7,
+			Name:                 "hello there",
+		}
+		err := c.Pin(ctx, test.Cid1, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,12 +158,12 @@ func TestPin(t *testing.T) {
 }
 
 func TestUnpin(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		err := c.Unpin(ci)
+		err := c.Unpin(ctx, test.Cid1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,12 +172,114 @@ func TestUnpin(t *testing.T) {
 	testClients(t, api, testF)
 }
 
-func TestAllocations(t *testing.T) {
+type pathCase struct {
+	path        string
+	wantErr     bool
+	expectedCid string
+}
+
+var pathTestCases = []pathCase{
+	{
+		test.CidResolved.String(),
+		false,
+		test.CidResolved.String(),
+	},
+	{
+		test.PathIPFS1,
+		false,
+		"QmaNJ5acV31sx8jq626qTpAWW4DXKw34aGhx53dECLvXbY",
+	},
+	{
+		test.PathIPFS2,
+		false,
+		test.CidResolved.String(),
+	},
+	{
+		test.PathIPNS1,
+		false,
+		test.CidResolved.String(),
+	},
+	{
+		test.PathIPLD1,
+		false,
+		"QmaNJ5acV31sx8jq626qTpAWW4DXKw34aGhx53dECLvXbY",
+	},
+	{
+		test.InvalidPath1,
+		true,
+		"",
+	},
+}
+
+func TestPinPath(t *testing.T) {
+	ctx := context.Background()
+	api := testAPI(t)
+	defer shutdown(api)
+
+	opts := types.PinOptions{
+		ReplicationFactorMin: 6,
+		ReplicationFactorMax: 7,
+		Name:                 "hello there",
+		UserAllocations:      []peer.ID{test.PeerID1, test.PeerID2},
+	}
+
+	testF := func(t *testing.T, c Client) {
+		for _, testCase := range pathTestCases {
+			ec, _ := cid.Decode(testCase.expectedCid)
+			resultantPin := types.PinWithOpts(ec, opts)
+			p := testCase.path
+			pin, err := c.PinPath(ctx, p, opts)
+			if err != nil {
+				if testCase.wantErr {
+					continue
+				}
+				t.Fatalf("unexpected error %s: %s", p, err)
+			}
+
+			if !pin.Equals(resultantPin) {
+				t.Errorf("expected different pin: %s", p)
+				t.Errorf("expected: %+v", resultantPin)
+				t.Errorf("actual: %+v", pin)
+			}
+
+		}
+	}
+
+	testClients(t, api, testF)
+}
+
+func TestUnpinPath(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.Allocations(types.DataType | types.MetaType)
+		for _, testCase := range pathTestCases {
+			p := testCase.path
+			pin, err := c.UnpinPath(ctx, p)
+			if err != nil {
+				if testCase.wantErr {
+					continue
+				}
+				t.Fatalf("unepected error %s: %s", p, err)
+			}
+
+			if pin.Cid.String() != testCase.expectedCid {
+				t.Errorf("bad resolved Cid: %s, %s", p, pin.Cid)
+			}
+		}
+	}
+
+	testClients(t, api, testF)
+}
+
+func TestAllocations(t *testing.T) {
+	ctx := context.Background()
+	api := testAPI(t)
+	defer shutdown(api)
+
+	testF := func(t *testing.T, c Client) {
+		pins, err := c.Allocations(ctx, types.DataType|types.MetaType)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -179,16 +292,16 @@ func TestAllocations(t *testing.T) {
 }
 
 func TestAllocation(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Allocation(ci)
+		pin, err := c.Allocation(ctx, test.Cid1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pin.Cid.String() != test.TestCid1 {
+		if !pin.Cid.Equals(test.Cid1) {
 			t.Error("should be same pin")
 		}
 	}
@@ -197,16 +310,16 @@ func TestAllocation(t *testing.T) {
 }
 
 func TestStatus(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Status(ci, false)
+		pin, err := c.Status(ctx, test.Cid1, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pin.Cid.String() != test.TestCid1 {
+		if !pin.Cid.Equals(test.Cid1) {
 			t.Error("should be same pin")
 		}
 	}
@@ -215,11 +328,12 @@ func TestStatus(t *testing.T) {
 }
 
 func TestStatusAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.StatusAll(false)
+		pins, err := c.StatusAll(ctx, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -227,22 +341,53 @@ func TestStatusAll(t *testing.T) {
 		if len(pins) == 0 {
 			t.Error("there should be some pins")
 		}
+
+		// With local true
+		pins, err = c.StatusAll(ctx, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pins) != 2 {
+			t.Error("there should be two pins")
+		}
+
+		// With filter option
+		pins, err = c.StatusAll(ctx, types.TrackerStatusPinning, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pins) != 1 {
+			t.Error("there should be one pin")
+		}
+
+		pins, err = c.StatusAll(ctx, types.TrackerStatusPinned|types.TrackerStatusError, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pins) != 2 {
+			t.Error("there should be two pins")
+		}
+
+		pins, err = c.StatusAll(ctx, 1<<25, false)
+		if err == nil {
+			t.Error("expected an error")
+		}
 	}
 
 	testClients(t, api, testF)
 }
 
 func TestSync(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Sync(ci, false)
+		pin, err := c.Sync(ctx, test.Cid1, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pin.Cid.String() != test.TestCid1 {
+		if !pin.Cid.Equals(test.Cid1) {
 			t.Error("should be same pin")
 		}
 	}
@@ -251,11 +396,12 @@ func TestSync(t *testing.T) {
 }
 
 func TestSyncAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		pins, err := c.SyncAll(false)
+		pins, err := c.SyncAll(ctx, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -269,16 +415,16 @@ func TestSyncAll(t *testing.T) {
 }
 
 func TestRecover(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
-		pin, err := c.Recover(ci, false)
+		pin, err := c.Recover(ctx, test.Cid1, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pin.Cid.String() != test.TestCid1 {
+		if !pin.Cid.Equals(test.Cid1) {
 			t.Error("should be same pin")
 		}
 	}
@@ -287,11 +433,12 @@ func TestRecover(t *testing.T) {
 }
 
 func TestRecoverAll(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		_, err := c.RecoverAll(true)
+		_, err := c.RecoverAll(ctx, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -301,11 +448,12 @@ func TestRecoverAll(t *testing.T) {
 }
 
 func TestGetConnectGraph(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
 	defer shutdown(api)
 
 	testF := func(t *testing.T, c Client) {
-		cg, err := c.GetConnectGraph()
+		cg, err := c.GetConnectGraph(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,64 +466,83 @@ func TestGetConnectGraph(t *testing.T) {
 	testClients(t, api, testF)
 }
 
+func TestMetrics(t *testing.T) {
+	ctx := context.Background()
+	api := testAPI(t)
+	defer shutdown(api)
+
+	testF := func(t *testing.T, c Client) {
+		m, err := c.Metrics(ctx, "somemetricstype")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(m) == 0 {
+			t.Fatal("No metrics found")
+		}
+	}
+
+	testClients(t, api, testF)
+}
+
 type waitService struct {
 	l        sync.Mutex
 	pinStart time.Time
 }
 
-func (wait *waitService) Pin(ctx context.Context, in api.PinSerial, out *struct{}) error {
+func (wait *waitService) Pin(ctx context.Context, in *api.Pin, out *struct{}) error {
 	wait.l.Lock()
 	defer wait.l.Unlock()
 	wait.pinStart = time.Now()
 	return nil
 }
 
-func (wait *waitService) Status(ctx context.Context, in api.PinSerial, out *api.GlobalPinInfoSerial) error {
+func (wait *waitService) Status(ctx context.Context, in cid.Cid, out *api.GlobalPinInfo) error {
 	wait.l.Lock()
 	defer wait.l.Unlock()
-	c1, _ := cid.Decode(in.Cid)
 	if time.Now().After(wait.pinStart.Add(5 * time.Second)) { //pinned
 		*out = api.GlobalPinInfo{
-			Cid: c1,
-			PeerMap: map[peer.ID]api.PinInfo{
-				test.TestPeerID1: {
-					Cid:    c1,
-					Peer:   test.TestPeerID1,
+			Cid: in,
+			PeerMap: map[string]*api.PinInfo{
+				peer.IDB58Encode(test.PeerID1): {
+					Cid:    in,
+					Peer:   test.PeerID1,
 					Status: api.TrackerStatusPinned,
 					TS:     wait.pinStart,
 				},
-				test.TestPeerID2: {
-					Cid:    c1,
-					Peer:   test.TestPeerID2,
+				peer.IDB58Encode(test.PeerID2): {
+					Cid:    in,
+					Peer:   test.PeerID2,
 					Status: api.TrackerStatusPinned,
 					TS:     wait.pinStart,
 				},
 			},
-		}.ToSerial()
+		}
 	} else { // pinning
 		*out = api.GlobalPinInfo{
-			Cid: c1,
-			PeerMap: map[peer.ID]api.PinInfo{
-				test.TestPeerID1: {
-					Cid:    c1,
-					Peer:   test.TestPeerID1,
+			Cid: in,
+			PeerMap: map[string]*api.PinInfo{
+				peer.IDB58Encode(test.PeerID1): {
+					Cid:    in,
+					Peer:   test.PeerID1,
 					Status: api.TrackerStatusPinning,
 					TS:     wait.pinStart,
 				},
-				test.TestPeerID2: {
-					Cid:    c1,
-					Peer:   test.TestPeerID2,
+				peer.IDB58Encode(test.PeerID2): {
+					Cid:    in,
+					Peer:   test.PeerID2,
 					Status: api.TrackerStatusPinned,
 					TS:     wait.pinStart,
 				},
 			},
-		}.ToSerial()
+		}
 	}
 
 	return nil
 }
 
 func TestWaitFor(t *testing.T) {
+	ctx := context.Background()
 	tapi := testAPI(t)
 	defer shutdown(tapi)
 
@@ -389,7 +556,6 @@ func TestWaitFor(t *testing.T) {
 	tapi.SetClient(rpcC)
 
 	testF := func(t *testing.T, c Client) {
-		ci, _ := cid.Decode(test.TestCid1)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -399,7 +565,7 @@ func TestWaitFor(t *testing.T) {
 			defer cancel()
 
 			fp := StatusFilterParams{
-				Cid:       ci,
+				Cid:       test.Cid1,
 				Local:     false,
 				Target:    api.TrackerStatusPinned,
 				CheckFreq: time.Second,
@@ -420,7 +586,7 @@ func TestWaitFor(t *testing.T) {
 				}
 			}
 		}()
-		err := c.Pin(ci, 0, 0, "test")
+		err := c.Pin(ctx, test.Cid1, types.PinOptions{ReplicationFactorMin: 0, ReplicationFactorMax: 0, Name: "test", ShardSize: 0})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -431,12 +597,14 @@ func TestWaitFor(t *testing.T) {
 }
 
 func TestAddMultiFile(t *testing.T) {
+	ctx := context.Background()
 	api := testAPI(t)
-	defer api.Shutdown()
+	defer api.Shutdown(ctx)
+
+	sth := test.NewShardingTestHelper()
+	defer sth.Clean(t)
 
 	testF := func(t *testing.T, c Client) {
-		sth := test.NewShardingTestHelper()
-		defer sth.Clean(t)
 		mfr, closer := sth.GetTreeMultiReader(t)
 		defer closer.Close()
 
@@ -447,11 +615,12 @@ func TestAddMultiFile(t *testing.T) {
 				Name:                 "test something",
 				ShardSize:            1024,
 			},
-			Shard:     false,
-			Layout:    "",
-			Chunker:   "",
-			RawLeaves: false,
-			Hidden:    false,
+			Shard:          false,
+			Layout:         "",
+			Chunker:        "",
+			RawLeaves:      false,
+			Hidden:         false,
+			StreamChannels: true,
 		}
 
 		out := make(chan *types.AddedOutput, 1)
@@ -464,7 +633,7 @@ func TestAddMultiFile(t *testing.T) {
 			}
 		}()
 
-		err := c.AddMultiFile(mfr, p, out)
+		err := c.AddMultiFile(ctx, mfr, p, out)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,10 +1,11 @@
-FROM golang:1.11-stretch AS builder
+FROM golang:1.12-stretch AS builder
 MAINTAINER Hector Sanjuan <hector@protocol.ai>
 
 # This build state just builds the cluster binaries
 
 ENV GOPATH     /go
 ENV SRC_PATH   $GOPATH/src/github.com/ipfs/ipfs-cluster
+ENV GO111MODULE on
 
 COPY . $SRC_PATH
 WORKDIR $SRC_PATH
@@ -45,10 +46,12 @@ COPY --from=builder /tmp/jq-linux64 /usr/local/bin/jq
 COPY --from=builder /bin/bash /bin/bash
 COPY --from=builder /lib/x86_64-linux-gnu/libtinfo.so.5 /lib64/libtinfo.so.5
 
-
+USER root
 
 RUN mkdir -p $IPFS_CLUSTER_PATH && \
     chown 1000:100 $IPFS_CLUSTER_PATH
+
+USER ipfs
 
 VOLUME $IPFS_CLUSTER_PATH
 ENTRYPOINT ["/usr/local/bin/start-daemons.sh"]

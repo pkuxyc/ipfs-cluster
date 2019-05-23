@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -9,12 +10,25 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"testing"
+	"time"
 
 	"github.com/ipfs/ipfs-cluster/api"
-	"github.com/ipfs/ipfs-cluster/state/mapstate"
+	"github.com/ipfs/ipfs-cluster/datastore/inmem"
+	"github.com/ipfs/ipfs-cluster/state"
+	"github.com/ipfs/ipfs-cluster/state/dsstate"
 
 	cid "github.com/ipfs/go-cid"
 	u "github.com/ipfs/go-ipfs-util"
+	cors "github.com/rs/cors"
+)
+
+// Some values used by the ipfs mock
+const (
+	IpfsCustomHeaderName  = "X-Custom-Header"
+	IpfsTimeHeaderName    = "X-Time-Now"
+	IpfsCustomHeaderValue = "42"
+	IpfsACAOrigin         = "myorigin"
 )
 
 // IpfsMock is an ipfs daemon mock which should sustain the functionality used by ipfscluster.
@@ -22,7 +36,7 @@ type IpfsMock struct {
 	server     *httptest.Server
 	Addr       string
 	Port       int
-	pinMap     *mapstate.MapState
+	pinMap     state.State
 	BlockStore map[string][]byte
 }
 
@@ -84,14 +98,30 @@ type mockBlockPutResp struct {
 }
 
 // NewIpfsMock returns a new mock.
-func NewIpfsMock() *IpfsMock {
-	st := mapstate.NewMapState()
+func NewIpfsMock(t *testing.T) *IpfsMock {
+	store := inmem.New()
+	st, err := dsstate.New(store, "", dsstate.DefaultHandle())
+	if err != nil {
+		t.Fatal(err)
+	}
 	blocks := make(map[string][]byte)
 	m := &IpfsMock{
 		pinMap:     st,
 		BlockStore: blocks,
 	}
-	ts := httptest.NewServer(http.HandlerFunc(m.handler))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", m.handler)
+
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{IpfsACAOrigin},
+		AllowedMethods:   []string{"POST"},
+		ExposedHeaders:   []string{"X-Stream-Output", "X-Chunked-Output", "X-Content-Length"},
+		AllowCredentials: true, // because IPFS does it, even if for no reason.
+	})
+	corsHandler := c.Handler(mux)
+
+	ts := httptest.NewServer(corsHandler)
 	m.server = ts
 
 	url, _ := url.Parse(ts.URL)
@@ -106,12 +136,16 @@ func NewIpfsMock() *IpfsMock {
 
 // FIXME: what if IPFS API changes?
 func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
 	p := r.URL.Path
+	w.Header().Set(IpfsCustomHeaderName, IpfsCustomHeaderValue)
+	w.Header().Set("Server", "ipfs-mock")
+	w.Header().Set(IpfsTimeHeaderName, fmt.Sprintf("%d", time.Now().Unix()))
 	endp := strings.TrimPrefix(p, "/api/v0/")
 	switch endp {
 	case "id":
 		resp := mockIDResp{
-			ID: TestPeerID1.Pretty(),
+			ID: PeerID1.Pretty(),
 			Addresses: []string{
 				"/ip4/0.0.0.0/tcp/1234",
 			},
@@ -123,14 +157,14 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			goto ERROR
 		}
-		if arg == ErrorCid {
+		if arg == ErrorCid.String() {
 			goto ERROR
 		}
 		c, err := cid.Decode(arg)
 		if err != nil {
 			goto ERROR
 		}
-		m.pinMap.Add(api.PinCid(c))
+		m.pinMap.Add(ctx, api.PinCid(c))
 		resp := mockPinResp{
 			Pins: []string{arg},
 		}
@@ -145,7 +179,7 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			goto ERROR
 		}
-		m.pinMap.Rm(c)
+		m.pinMap.Rm(ctx, c)
 		resp := mockPinResp{
 			Pins: []string{arg},
 		}
@@ -155,7 +189,10 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		arg, ok := extractCid(r.URL)
 		if !ok {
 			rMap := make(map[string]mockPinType)
-			pins := m.pinMap.List()
+			pins, err := m.pinMap.List(ctx)
+			if err != nil {
+				goto ERROR
+			}
 			for _, p := range pins {
 				rMap[p.Cid.String()] = mockPinType{"recursive"}
 			}
@@ -169,7 +206,10 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			goto ERROR
 		}
-		ok = m.pinMap.Has(c)
+		ok, err = m.pinMap.Has(ctx, c)
+		if err != nil {
+			goto ERROR
+		}
 		if ok {
 			rMap := make(map[string]mockPinType)
 			rMap[cidStr] = mockPinType{"recursive"}
@@ -198,10 +238,10 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		w.Write(j)
 	case "swarm/peers":
 		peer1 := mockIpfsPeer{
-			Peer: TestPeerID4.Pretty(),
+			Peer: PeerID4.Pretty(),
 		}
 		peer2 := mockIpfsPeer{
-			Peer: TestPeerID5.Pretty(),
+			Peer: PeerID5.Pretty(),
 		}
 		resp := mockSwarmPeersResp{
 			Peers: []mockIpfsPeer{peer1, peer2},
@@ -262,7 +302,11 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		w.Write(data)
 	case "repo/stat":
 		sizeOnly := r.URL.Query().Get("size-only")
-		len := len(m.pinMap.List())
+		list, err := m.pinMap.List(ctx)
+		if err != nil {
+			goto ERROR
+		}
+		len := len(list)
 		numObjs := uint64(len)
 		if sizeOnly == "true" {
 			numObjs = 0
@@ -274,6 +318,8 @@ func (m *IpfsMock) handler(w http.ResponseWriter, r *http.Request) {
 		}
 		j, _ := json.Marshal(resp)
 		w.Write(j)
+	case "resolve":
+		w.Write([]byte("{\"Path\":\"" + "/ipfs/" + CidResolved.String() + "\"}"))
 	case "config/show":
 		resp := mockConfigResp{
 			Datastore: struct {

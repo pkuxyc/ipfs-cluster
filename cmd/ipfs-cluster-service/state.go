@@ -1,175 +1,197 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 
 	ipfscluster "github.com/ipfs/ipfs-cluster"
 	"github.com/ipfs/ipfs-cluster/api"
+	"github.com/ipfs/ipfs-cluster/config"
+	"github.com/ipfs/ipfs-cluster/consensus/crdt"
 	"github.com/ipfs/ipfs-cluster/consensus/raft"
+	"github.com/ipfs/ipfs-cluster/datastore/badger"
+	"github.com/ipfs/ipfs-cluster/datastore/inmem"
 	"github.com/ipfs/ipfs-cluster/pstoremgr"
-	"github.com/ipfs/ipfs-cluster/state/mapstate"
+	"github.com/ipfs/ipfs-cluster/state"
+
+	ds "github.com/ipfs/go-datastore"
 )
 
-var errNoSnapshot = errors.New("no snapshot found")
-
-func upgrade() error {
-	newState, current, err := restoreStateFromDisk()
-	if err != nil {
-		return err
-	}
-
-	if current {
-		logger.Warning("Skipping migration of up-to-date state")
-		return nil
-	}
-
-	cfgMgr, cfgs := makeConfigs()
-
-	err = cfgMgr.LoadJSONFromFile(configPath)
-	if err != nil {
-		return err
-	}
-
-	pm := pstoremgr.New(nil, cfgs.clusterCfg.GetPeerstorePath())
-	raftPeers := append(ipfscluster.PeersFromMultiaddrs(pm.LoadPeerstore()), cfgs.clusterCfg.ID)
-	return raft.SnapshotSave(cfgs.consensusCfg, newState, raftPeers)
+type stateManager interface {
+	ImportState(io.Reader) error
+	ExportState(io.Writer) error
+	GetStore() (ds.Datastore, error)
+	Clean() error
 }
 
-func export(w io.Writer) error {
-	stateToExport, _, err := restoreStateFromDisk()
+func newStateManager(consensus string, ident *config.Identity, cfgs *cfgs) stateManager {
+	switch consensus {
+	case "raft":
+		return &raftStateManager{ident, cfgs}
+	case "crdt":
+		return &crdtStateManager{ident, cfgs}
+	case "":
+		checkErr("", errors.New("unspecified consensus component"))
+	default:
+		checkErr("", fmt.Errorf("unknown consensus component '%s'", consensus))
+	}
+	return nil
+}
+
+type raftStateManager struct {
+	ident *config.Identity
+	cfgs  *cfgs
+}
+
+func (raftsm *raftStateManager) GetStore() (ds.Datastore, error) {
+	return inmem.New(), nil
+}
+
+func (raftsm *raftStateManager) getOfflineState(store ds.Datastore) (state.State, error) {
+	return raft.OfflineState(raftsm.cfgs.raftCfg, store)
+}
+
+func (raftsm *raftStateManager) ImportState(r io.Reader) error {
+	err := raftsm.Clean()
 	if err != nil {
 		return err
 	}
 
-	return exportState(stateToExport, w)
+	store, err := raftsm.GetStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	st, err := raftsm.getOfflineState(store)
+	if err != nil {
+		return err
+	}
+	err = importState(r, st)
+	if err != nil {
+		return err
+	}
+	pm := pstoremgr.New(nil, raftsm.cfgs.clusterCfg.GetPeerstorePath())
+	raftPeers := append(
+		ipfscluster.PeersFromMultiaddrs(pm.LoadPeerstore()),
+		raftsm.ident.ID,
+	)
+	return raft.SnapshotSave(raftsm.cfgs.raftCfg, st, raftPeers)
 }
 
-// restoreStateFromDisk returns a mapstate containing the latest
-// snapshot, a flag set to true when the state format has the
-// current version and an error
-func restoreStateFromDisk() (*mapstate.MapState, bool, error) {
-	cfgMgr, cfgs := makeConfigs()
-
-	err := cfgMgr.LoadJSONFromFile(configPath)
+func (raftsm *raftStateManager) ExportState(w io.Writer) error {
+	store, err := raftsm.GetStore()
 	if err != nil {
-		return nil, false, err
+		return err
 	}
-
-	r, snapExists, err := raft.LastStateRaw(cfgs.consensusCfg)
-	if !snapExists {
-		err = errNoSnapshot
-	}
+	defer store.Close()
+	st, err := raftsm.getOfflineState(store)
 	if err != nil {
-		return nil, false, err
+		return err
 	}
-
-	stateFromSnap := mapstate.NewMapState()
-	// duplicate reader to both check version and migrate
-	var buf bytes.Buffer
-	r2 := io.TeeReader(r, &buf)
-	raw, err := ioutil.ReadAll(r2)
-	if err != nil {
-		return nil, false, err
-	}
-	err = stateFromSnap.Unmarshal(raw)
-	if err != nil {
-		return nil, false, err
-	}
-	if stateFromSnap.GetVersion() == mapstate.Version {
-		return stateFromSnap, true, nil
-	}
-
-	err = stateFromSnap.Migrate(&buf)
-	if err != nil {
-		return nil, false, err
-	}
-
-	return stateFromSnap, false, nil
+	return exportState(w, st)
 }
 
-func stateImport(r io.Reader) error {
-	cfgMgr, cfgs := makeConfigs()
+func (raftsm *raftStateManager) Clean() error {
+	return raft.CleanupRaft(raftsm.cfgs.raftCfg)
+}
 
-	err := cfgMgr.LoadJSONFromFile(configPath)
+type crdtStateManager struct {
+	ident *config.Identity
+	cfgs  *cfgs
+}
+
+func (crdtsm *crdtStateManager) GetStore() (ds.Datastore, error) {
+	bds, err := badger.New(crdtsm.cfgs.badgerCfg)
+	if err != nil {
+		return nil, err
+	}
+	return bds, nil
+}
+
+func (crdtsm *crdtStateManager) getOfflineState(store ds.Datastore) (state.BatchingState, error) {
+	return crdt.OfflineState(crdtsm.cfgs.crdtCfg, store)
+}
+
+func (crdtsm *crdtStateManager) ImportState(r io.Reader) error {
+	err := crdtsm.Clean()
 	if err != nil {
 		return err
 	}
 
-	pinSerials := make([]api.PinSerial, 0)
+	store, err := crdtsm.GetStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	st, err := crdtsm.getOfflineState(store)
+	if err != nil {
+		return err
+	}
+
+	err = importState(r, st)
+	if err != nil {
+		return err
+	}
+
+	return st.Commit(context.Background())
+}
+
+func (crdtsm *crdtStateManager) ExportState(w io.Writer) error {
+	store, err := crdtsm.GetStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	st, err := crdtsm.getOfflineState(store)
+	if err != nil {
+		return err
+	}
+	return exportState(w, st)
+}
+
+func (crdtsm *crdtStateManager) Clean() error {
+	store, err := crdtsm.GetStore()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return crdt.Clean(context.Background(), crdtsm.cfgs.crdtCfg, store)
+}
+
+func importState(r io.Reader, st state.State) error {
+	ctx := context.Background()
 	dec := json.NewDecoder(r)
-	err = dec.Decode(&pinSerials)
-	if err != nil {
-		return err
-	}
-
-	stateToImport := mapstate.NewMapState()
-	for _, pS := range pinSerials {
-		err = stateToImport.Add(pS.ToPin())
+	for {
+		var pin api.Pin
+		err := dec.Decode(&pin)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		err = st.Add(ctx, &pin)
 		if err != nil {
 			return err
 		}
 	}
-
-	pm := pstoremgr.New(nil, cfgs.clusterCfg.GetPeerstorePath())
-	raftPeers := append(ipfscluster.PeersFromMultiaddrs(pm.LoadPeerstore()), cfgs.clusterCfg.ID)
-	return raft.SnapshotSave(cfgs.consensusCfg, stateToImport, raftPeers)
-}
-
-func validateVersion(cfg *ipfscluster.Config, cCfg *raft.Config) error {
-	state := mapstate.NewMapState()
-	r, snapExists, err := raft.LastStateRaw(cCfg)
-	if !snapExists && err != nil {
-		logger.Error("error before reading latest snapshot.")
-	} else if snapExists && err != nil {
-		logger.Error("error after reading last snapshot. Snapshot potentially corrupt.")
-	} else if snapExists && err == nil {
-		raw, err2 := ioutil.ReadAll(r)
-		if err2 != nil {
-			return err2
-		}
-		err2 = state.Unmarshal(raw)
-		if err2 != nil {
-			logger.Error("error unmarshalling snapshot. Snapshot potentially corrupt.")
-			return err2
-		}
-		if state.GetVersion() != mapstate.Version {
-			logger.Error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-			logger.Error("Out of date ipfs-cluster state is saved.")
-			logger.Error("To migrate to the new version, run ipfs-cluster-service state upgrade.")
-			logger.Error("To launch a node without this state, rename the consensus data directory.")
-			logger.Error("Hint, the default is .ipfs-cluster/ipfs-cluster-data.")
-			logger.Error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-			err = errors.New("outdated state version stored")
-		}
-	} // !snapExists && err == nil // no existing state, no check needed
-	return err
 }
 
 // ExportState saves a json representation of a state
-func exportState(state *mapstate.MapState, w io.Writer) error {
-	// Serialize pins
-	pins := state.List()
-	pinSerials := make([]api.PinSerial, len(pins), len(pins))
-	for i, pin := range pins {
-		pinSerials[i] = pin.ToSerial()
+func exportState(w io.Writer, st state.State) error {
+	pins, err := st.List(context.Background())
+	if err != nil {
+		return err
 	}
-
-	// Write json to output file
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "    ")
-	return enc.Encode(pinSerials)
-}
-
-// CleanupState cleans the state
-func cleanupState(cCfg *raft.Config) error {
-	err := raft.CleanupRaft(cCfg.GetDataFolder(), cCfg.BackupsRotate)
-	if err == nil {
-		logger.Warningf("the %s folder has been rotated.  Next start will use an empty state", cCfg.GetDataFolder())
+	for _, pin := range pins {
+		err := enc.Encode(pin)
+		if err != nil {
+			return err
+		}
 	}
-
-	return err
+	return nil
 }

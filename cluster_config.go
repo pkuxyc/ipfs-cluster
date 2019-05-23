@@ -1,13 +1,13 @@
 package ipfscluster
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -15,8 +15,6 @@ import (
 
 	"github.com/ipfs/ipfs-cluster/config"
 
-	crypto "github.com/libp2p/go-libp2p-crypto"
-	peer "github.com/libp2p/go-libp2p-peer"
 	pnet "github.com/libp2p/go-libp2p-pnet"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -25,8 +23,6 @@ const configKey = "cluster"
 
 // Configuration defaults
 const (
-	DefaultConfigCrypto        = crypto.RSA
-	DefaultConfigKeyLength     = 2048
 	DefaultListenAddr          = "/ip4/0.0.0.0/tcp/9096"
 	DefaultStateSyncInterval   = 600 * time.Second
 	DefaultIPFSSyncInterval    = 130 * time.Second
@@ -46,11 +42,6 @@ type Config struct {
 	lock          sync.Mutex
 	peerstoreLock sync.Mutex
 
-	// Libp2p ID and private key for Cluster communication (including)
-	// the Consensus component.
-	ID         peer.ID
-	PrivateKey crypto.PrivKey
-
 	// User-defined peername for use as human-readable identifier.
 	Peername string
 
@@ -58,6 +49,9 @@ type Config struct {
 	// only if they have the same ClusterSecret. The cluster secret must be exactly
 	// 64 characters and contain only hexadecimal characters (`[0-9a-f]`).
 	Secret []byte
+
+	// RPCPolicy defines access control to RPC endpoints.
+	RPCPolicy map[string]RPCEndpointType
 
 	// Leave Cluster on shutdown. Politely informs other peers
 	// of the departure and removes itself from the consensus
@@ -120,29 +114,29 @@ type Config struct {
 	// Peerstore file specifies the file on which we persist the
 	// libp2p host peerstore addresses. This file is regularly saved.
 	PeerstoreFile string
+
+	// Tracing flag used to skip tracing specific paths when not enabled.
+	Tracing bool
 }
 
 // configJSON represents a Cluster configuration as it will look when it is
 // saved using JSON. Most configuration keys are converted into simple types
 // like strings, and key names aim to be self-explanatory for the user.
 type configJSON struct {
-	ID                   string   `json:"id"`
-	Peername             string   `json:"peername"`
-	PrivateKey           string   `json:"private_key"`
-	Secret               string   `json:"secret"`
-	Peers                []string `json:"peers,omitempty"`     // DEPRECATED
-	Bootstrap            []string `json:"bootstrap,omitempty"` // DEPRECATED
-	LeaveOnShutdown      bool     `json:"leave_on_shutdown"`
-	ListenMultiaddress   string   `json:"listen_multiaddress"`
-	StateSyncInterval    string   `json:"state_sync_interval"`
-	IPFSSyncInterval     string   `json:"ipfs_sync_interval"`
-	ReplicationFactor    int      `json:"replication_factor,omitempty"` // legacy
-	ReplicationFactorMin int      `json:"replication_factor_min"`
-	ReplicationFactorMax int      `json:"replication_factor_max"`
-	MonitorPingInterval  string   `json:"monitor_ping_interval"`
-	PeerWatchInterval    string   `json:"peer_watch_interval"`
-	DisableRepinning     bool     `json:"disable_repinning"`
-	PeerstoreFile        string   `json:"peerstore_file,omitempty"`
+	ID                   string `json:"id,omitempty"`
+	Peername             string `json:"peername"`
+	PrivateKey           string `json:"private_key,omitempty"`
+	Secret               string `json:"secret"`
+	LeaveOnShutdown      bool   `json:"leave_on_shutdown"`
+	ListenMultiaddress   string `json:"listen_multiaddress"`
+	StateSyncInterval    string `json:"state_sync_interval"`
+	IPFSSyncInterval     string `json:"ipfs_sync_interval"`
+	ReplicationFactorMin int    `json:"replication_factor_min"`
+	ReplicationFactorMax int    `json:"replication_factor_max"`
+	MonitorPingInterval  string `json:"monitor_ping_interval"`
+	PeerWatchInterval    string `json:"peer_watch_interval"`
+	DisableRepinning     bool   `json:"disable_repinning"`
+	PeerstoreFile        string `json:"peerstore_file,omitempty"`
 }
 
 // ConfigKey returns a human-readable string to identify
@@ -153,25 +147,9 @@ func (cfg *Config) ConfigKey() string {
 
 // Default fills in all the Config fields with
 // default working values. This means, it will
-// generate a valid random ID, PrivateKey and
-// Secret.
+// generate a Secret.
 func (cfg *Config) Default() error {
 	cfg.setDefaults()
-
-	// pid and private key generation --
-	priv, pub, err := crypto.GenerateKeyPair(
-		DefaultConfigCrypto,
-		DefaultConfigKeyLength)
-	if err != nil {
-		return err
-	}
-	pid, err := peer.IDFromPublicKey(pub)
-	if err != nil {
-		return err
-	}
-	cfg.ID = pid
-	cfg.PrivateKey = priv
-	// --
 
 	// cluster secret
 	clusterSecret, err := pnet.GenerateV1Bytes()
@@ -180,26 +158,31 @@ func (cfg *Config) Default() error {
 	}
 	cfg.Secret = (*clusterSecret)[:]
 	// --
+
 	return nil
+}
+
+// ApplyEnvVars fills in any Config fields found
+// as environment variables.
+func (cfg *Config) ApplyEnvVars() error {
+	jcfg, err := cfg.toConfigJSON()
+	if err != nil {
+		return err
+	}
+
+	err = envconfig.Process(cfg.ConfigKey(), jcfg)
+	if err != nil {
+		return err
+	}
+
+	return cfg.applyConfigJSON(jcfg)
 }
 
 // Validate will check that the values of this config
 // seem to be working ones.
 func (cfg *Config) Validate() error {
-	if cfg.ID == "" {
-		return errors.New("cluster.ID not set")
-	}
-
-	if cfg.PrivateKey == nil {
-		return errors.New("no cluster.private_key set")
-	}
-
-	if !cfg.ID.MatchesPrivateKey(cfg.PrivateKey) {
-		return errors.New("cluster.ID does not match the private_key")
-	}
-
 	if cfg.ListenAddr == nil {
-		return errors.New("cluster.listen_addr is indefined")
+		return errors.New("cluster.listen_multiaddress is undefined")
 	}
 
 	if cfg.StateSyncInterval <= 0 {
@@ -221,7 +204,11 @@ func (cfg *Config) Validate() error {
 	rfMax := cfg.ReplicationFactorMax
 	rfMin := cfg.ReplicationFactorMin
 
-	return isReplicationFactorValid(rfMin, rfMax)
+	if err := isReplicationFactorValid(rfMin, rfMax); err != nil {
+		return err
+	}
+
+	return isRPCPolicyValid(cfg.RPCPolicy)
 }
 
 func isReplicationFactorValid(rplMin, rplMax int) error {
@@ -248,6 +235,34 @@ func isReplicationFactorValid(rplMin, rplMax int) error {
 	return nil
 }
 
+func isRPCPolicyValid(p map[string]RPCEndpointType) error {
+	rpcComponents := []interface{}{
+		&ClusterRPCAPI{},
+		&PinTrackerRPCAPI{},
+		&IPFSConnectorRPCAPI{},
+		&ConsensusRPCAPI{},
+		&PeerMonitorRPCAPI{},
+	}
+
+	total := 0
+	for _, c := range rpcComponents {
+		t := reflect.TypeOf(c)
+		for i := 0; i < t.NumMethod(); i++ {
+			total++
+			method := t.Method(i)
+			name := fmt.Sprintf("%s.%s", RPCServiceID(c), method.Name)
+			_, ok := p[name]
+			if !ok {
+				return fmt.Errorf("RPCPolicy is missing the %s method", name)
+			}
+		}
+	}
+	if len(p) != total {
+		logger.Warning("defined RPC policy has more entries than needed")
+	}
+	return nil
+}
+
 // this just sets non-generated defaults
 func (cfg *Config) setDefaults() {
 	hostname, err := os.Hostname()
@@ -267,6 +282,7 @@ func (cfg *Config) setDefaults() {
 	cfg.PeerWatchInterval = DefaultPeerWatchInterval
 	cfg.DisableRepinning = DefaultDisableRepinning
 	cfg.PeerstoreFile = "" // empty so it gets ommited.
+	cfg.RPCPolicy = DefaultRPCPolicy
 }
 
 // LoadJSON receives a raw json-formatted configuration and
@@ -282,62 +298,13 @@ func (cfg *Config) LoadJSON(raw []byte) error {
 
 	cfg.setDefaults()
 
-	if jcfg.Peers != nil || jcfg.Bootstrap != nil {
-		logger.Error(`
-Your configuration is using cluster.Peers and/or cluster.Bootstrap
-keys. Starting at version 0.4.0 these keys have been deprecated and replaced by
-the Peerstore file and the consensus.raft.InitialPeers key.
+	return cfg.applyConfigJSON(jcfg)
+}
 
-Bootstrap keeps working but only as a flag:
-
-"ipfs-cluster-service daemon --bootstrap <comma-separated-multiaddresses>"
-
-If you want to upgrade the existing peers that belong to a cluster:
-
-* Write your peers multiaddresses in the peerstore file (1 per line): ~/.ipfs-cluster/peerstore
-* Remove Peers and Bootstrap from your configuration
-
-Please check the docs (https://cluster.ipfs.io/documentation/configuration/)
-for more information.`)
-		return errors.New("cluster.Peers and cluster.Bootstrap keys have been deprecated")
-	}
-
-	// override json config with env var
-	err = envconfig.Process(cfg.ConfigKey(), jcfg)
-	if err != nil {
-		return err
-	}
-
-	parseDuration := func(txt string) time.Duration {
-		d, _ := time.ParseDuration(txt)
-		if txt != "" && d == 0 {
-			logger.Warningf("%s is not a valid duration. Default will be used", txt)
-		}
-		return d
-	}
-
+func (cfg *Config) applyConfigJSON(jcfg *configJSON) error {
 	config.SetIfNotDefault(jcfg.PeerstoreFile, &cfg.PeerstoreFile)
 
-	id, err := peer.IDB58Decode(jcfg.ID)
-	if err != nil {
-		err = fmt.Errorf("error decoding cluster ID: %s", err)
-		return err
-	}
-	cfg.ID = id
-
 	config.SetIfNotDefault(jcfg.Peername, &cfg.Peername)
-
-	pkb, err := base64.StdEncoding.DecodeString(jcfg.PrivateKey)
-	if err != nil {
-		err = fmt.Errorf("error decoding private_key: %s", err)
-		return err
-	}
-	pKey, err := crypto.UnmarshalPrivateKey(pkb)
-	if err != nil {
-		err = fmt.Errorf("error parsing private_key ID: %s", err)
-		return err
-	}
-	cfg.PrivateKey = pKey
 
 	clusterSecret, err := DecodeClusterSecret(jcfg.Secret)
 	if err != nil {
@@ -355,22 +322,18 @@ for more information.`)
 
 	rplMin := jcfg.ReplicationFactorMin
 	rplMax := jcfg.ReplicationFactorMax
-	if jcfg.ReplicationFactor != 0 { // read min and max
-		rplMin = jcfg.ReplicationFactor
-		rplMax = rplMin
-	}
 	config.SetIfNotDefault(rplMin, &cfg.ReplicationFactorMin)
 	config.SetIfNotDefault(rplMax, &cfg.ReplicationFactorMax)
 
-	stateSyncInterval := parseDuration(jcfg.StateSyncInterval)
-	ipfsSyncInterval := parseDuration(jcfg.IPFSSyncInterval)
-	monitorPingInterval := parseDuration(jcfg.MonitorPingInterval)
-	peerWatchInterval := parseDuration(jcfg.PeerWatchInterval)
-
-	config.SetIfNotDefault(stateSyncInterval, &cfg.StateSyncInterval)
-	config.SetIfNotDefault(ipfsSyncInterval, &cfg.IPFSSyncInterval)
-	config.SetIfNotDefault(monitorPingInterval, &cfg.MonitorPingInterval)
-	config.SetIfNotDefault(peerWatchInterval, &cfg.PeerWatchInterval)
+	err = config.ParseDurations("cluster",
+		&config.DurationOpt{Duration: jcfg.StateSyncInterval, Dst: &cfg.StateSyncInterval, Name: "state_sync_interval"},
+		&config.DurationOpt{Duration: jcfg.IPFSSyncInterval, Dst: &cfg.IPFSSyncInterval, Name: "ipfs_sync_interval"},
+		&config.DurationOpt{Duration: jcfg.MonitorPingInterval, Dst: &cfg.MonitorPingInterval, Name: "monitor_ping_interval"},
+		&config.DurationOpt{Duration: jcfg.PeerWatchInterval, Dst: &cfg.PeerWatchInterval, Name: "peer_watch_interval"},
+	)
+	if err != nil {
+		return err
+	}
 
 	cfg.LeaveOnShutdown = jcfg.LeaveOnShutdown
 	cfg.DisableRepinning = jcfg.DisableRepinning
@@ -380,6 +343,16 @@ for more information.`)
 
 // ToJSON generates a human-friendly version of Config.
 func (cfg *Config) ToJSON() (raw []byte, err error) {
+	jcfg, err := cfg.toConfigJSON()
+	if err != nil {
+		return
+	}
+
+	raw, err = json.MarshalIndent(jcfg, "", "    ")
+	return
+}
+
+func (cfg *Config) toConfigJSON() (jcfg *configJSON, err error) {
 	// Multiaddress String() may panic
 	defer func() {
 		if r := recover(); r != nil {
@@ -387,19 +360,10 @@ func (cfg *Config) ToJSON() (raw []byte, err error) {
 		}
 	}()
 
-	jcfg := &configJSON{}
-
-	// Private Key
-	pkeyBytes, err := cfg.PrivateKey.Bytes()
-	if err != nil {
-		return
-	}
-	pKey := base64.StdEncoding.EncodeToString(pkeyBytes)
+	jcfg = &configJSON{}
 
 	// Set all configuration fields
-	jcfg.ID = cfg.ID.Pretty()
 	jcfg.Peername = cfg.Peername
-	jcfg.PrivateKey = pKey
 	jcfg.Secret = EncodeProtectorKey(cfg.Secret)
 	jcfg.ReplicationFactorMin = cfg.ReplicationFactorMin
 	jcfg.ReplicationFactorMax = cfg.ReplicationFactorMax
@@ -412,7 +376,6 @@ func (cfg *Config) ToJSON() (raw []byte, err error) {
 	jcfg.DisableRepinning = cfg.DisableRepinning
 	jcfg.PeerstoreFile = cfg.PeerstoreFile
 
-	raw, err = json.MarshalIndent(jcfg, "", "    ")
 	return
 }
 

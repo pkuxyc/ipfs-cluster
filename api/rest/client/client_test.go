@@ -16,6 +16,7 @@ import (
 )
 
 func testAPI(t *testing.T) *rest.API {
+	ctx := context.Background()
 	//logging.SetDebugLogging()
 	apiMAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/0")
 
@@ -37,7 +38,7 @@ func testAPI(t *testing.T) *rest.API {
 		t.Fatal(err)
 	}
 
-	rest, err := rest.NewAPIWithHost(cfg, h)
+	rest, err := rest.NewAPIWithHost(ctx, cfg, h)
 	if err != nil {
 		t.Fatal("should be able to create a new Api: ", err)
 	}
@@ -47,7 +48,8 @@ func testAPI(t *testing.T) *rest.API {
 }
 
 func shutdown(a *rest.API) {
-	a.Shutdown()
+	ctx := context.Background()
+	a.Shutdown(ctx)
 	a.Host().Close()
 }
 
@@ -152,23 +154,54 @@ func TestMultiaddressPrecedence(t *testing.T) {
 }
 
 func TestHostPort(t *testing.T) {
-	cfg := &Config{
-		APIAddr:           nil,
-		Host:              "3.3.1.1",
-		Port:              "9094",
-		DisableKeepAlives: true,
-	}
-	c, err := NewDefaultClient(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dc := c.(*defaultClient)
-	if dc.hostname != "3.3.1.1:9094" {
-		t.Error("Host Port should be used")
+
+	type testcase struct {
+		host              string
+		port              string
+		expectedHostname  string
+		expectedProxyAddr string
 	}
 
-	if dc.config.ProxyAddr == nil || dc.config.ProxyAddr.String() != "/ip4/3.3.1.1/tcp/9095" {
-		t.Error("proxy address was not guessed correctly")
+	testcases := []testcase{
+		testcase{
+			host:              "3.3.1.1",
+			port:              "9094",
+			expectedHostname:  "3.3.1.1:9094",
+			expectedProxyAddr: "/ip4/3.3.1.1/tcp/9095",
+		},
+		testcase{
+			host:              "ipfs.io",
+			port:              "9094",
+			expectedHostname:  "ipfs.io:9094",
+			expectedProxyAddr: "/dns4/ipfs.io/tcp/9095",
+		},
+		testcase{
+			host:              "2001:db8::1",
+			port:              "9094",
+			expectedHostname:  "[2001:db8::1]:9094",
+			expectedProxyAddr: "/ip6/2001:db8::1/tcp/9095",
+		},
+	}
+
+	for _, tc := range testcases {
+		cfg := &Config{
+			APIAddr:           nil,
+			Host:              tc.host,
+			Port:              tc.port,
+			DisableKeepAlives: true,
+		}
+		c, err := NewDefaultClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc := c.(*defaultClient)
+		if dc.hostname != tc.expectedHostname {
+			t.Error("Host Port should be used")
+		}
+
+		if paddr := dc.config.ProxyAddr; paddr == nil || paddr.String() != tc.expectedProxyAddr {
+			t.Error("proxy address was not guessed correctly: ", paddr)
+		}
 	}
 }
 
@@ -185,12 +218,12 @@ func TestDNSMultiaddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc := c.(*defaultClient)
-	if dc.hostname != "127.0.0.1:1234" {
-		t.Error("bad resolved address")
+	if dc.hostname != "localhost:1234" {
+		t.Error("address should not be resolved")
 	}
 
-	if dc.config.ProxyAddr == nil || dc.config.ProxyAddr.String() != "/ip4/127.0.0.1/tcp/9095" {
-		t.Error("proxy address was not guessed correctly")
+	if paddr := dc.config.ProxyAddr; paddr == nil || paddr.String() != "/dns4/localhost/tcp/9095" {
+		t.Error("proxy address was not guessed correctly: ", paddr)
 	}
 }
 
@@ -233,7 +266,8 @@ func TestProxyAddress(t *testing.T) {
 }
 
 func TestIPFS(t *testing.T) {
-	ipfsMock := test.NewIpfsMock()
+	ctx := context.Background()
+	ipfsMock := test.NewIpfsMock(t)
 	defer ipfsMock.Close()
 
 	proxyAddr, err := ma.NewMultiaddr(
@@ -253,9 +287,9 @@ func TestIPFS(t *testing.T) {
 		t.Fatal(err)
 	}
 	dc := c.(*defaultClient)
-	ipfs := dc.IPFS()
+	ipfs := dc.IPFS(ctx)
 
-	err = ipfs.Pin(test.TestCid1)
+	err = ipfs.Pin(test.Cid1.String())
 	if err != nil {
 		t.Error(err)
 	}
@@ -265,7 +299,7 @@ func TestIPFS(t *testing.T) {
 		t.Error(err)
 	}
 
-	pin, ok := pins[test.TestCid1]
+	pin, ok := pins[test.Cid1.String()]
 	if !ok {
 		t.Error("pin should be in pin list")
 	}

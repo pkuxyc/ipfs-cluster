@@ -8,7 +8,8 @@ import (
 	"time"
 
 	"github.com/ipfs/ipfs-cluster/api"
-	"github.com/ipfs/ipfs-cluster/state/mapstate"
+	"github.com/ipfs/ipfs-cluster/datastore/inmem"
+	"github.com/ipfs/ipfs-cluster/state/dsstate"
 	"github.com/ipfs/ipfs-cluster/test"
 
 	cid "github.com/ipfs/go-cid"
@@ -21,7 +22,7 @@ func cleanRaft(idn int) {
 	os.RemoveAll(fmt.Sprintf("raftFolderFromTests-%d", idn))
 }
 
-func testPin(c cid.Cid) api.Pin {
+func testPin(c cid.Cid) *api.Pin {
 	p := api.PinCid(c)
 	p.ReplicationFactorMin = -1
 	p.ReplicationFactorMax = -1
@@ -40,41 +41,42 @@ func makeTestingHost(t *testing.T) host.Host {
 }
 
 func testingConsensus(t *testing.T, idn int) *Consensus {
+	ctx := context.Background()
 	cleanRaft(idn)
 	h := makeTestingHost(t)
-	st := mapstate.NewMapState()
 
 	cfg := &Config{}
 	cfg.Default()
 	cfg.DataFolder = fmt.Sprintf("raftFolderFromTests-%d", idn)
 	cfg.hostShutdown = true
 
-	cc, err := NewConsensus(h, cfg, st, false)
+	cc, err := NewConsensus(h, cfg, inmem.New(), false)
 	if err != nil {
 		t.Fatal("cannot create Consensus:", err)
 	}
 	cc.SetClient(test.NewMockRPCClientWithHost(t, h))
-	<-cc.Ready()
+	<-cc.Ready(ctx)
 	return cc
 }
 
 func TestShutdownConsensus(t *testing.T) {
+	ctx := context.Background()
 	// Bring it up twice to make sure shutdown cleans up properly
 	// but also to make sure raft comes up ok when re-initialized
 	cc := testingConsensus(t, 1)
 	defer cleanRaft(1)
-	err := cc.Shutdown()
+	err := cc.Shutdown(ctx)
 	if err != nil {
 		t.Fatal("Consensus cannot shutdown:", err)
 	}
-	err = cc.Shutdown() // should be fine to shutdown twice
+	err = cc.Shutdown(ctx) // should be fine to shutdown twice
 	if err != nil {
 		t.Fatal("Consensus should be able to shutdown several times")
 	}
 	cleanRaft(1)
 
 	cc = testingConsensus(t, 1)
-	err = cc.Shutdown()
+	err = cc.Shutdown(ctx)
 	if err != nil {
 		t.Fatal("Consensus cannot shutdown:", err)
 	}
@@ -82,90 +84,96 @@ func TestShutdownConsensus(t *testing.T) {
 }
 
 func TestConsensusPin(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	defer cleanRaft(1) // Remember defer runs in LIFO order
-	defer cc.Shutdown()
+	defer cc.Shutdown(ctx)
 
-	c, _ := cid.Decode(test.TestCid1)
-	err := cc.LogPin(testPin(c))
+	err := cc.LogPin(ctx, testPin(test.Cid1))
 	if err != nil {
 		t.Error("the operation did not make it to the log:", err)
 	}
 
 	time.Sleep(250 * time.Millisecond)
-	st, err := cc.State()
+	st, err := cc.State(ctx)
 	if err != nil {
-		t.Fatal("error gettinng state:", err)
+		t.Fatal("error getting state:", err)
 	}
 
-	pins := st.List()
-	if len(pins) != 1 || pins[0].Cid.String() != test.TestCid1 {
+	pins, err := st.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pins) != 1 || !pins[0].Cid.Equals(test.Cid1) {
 		t.Error("the added pin should be in the state")
 	}
 }
 
 func TestConsensusUnpin(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	defer cleanRaft(1)
-	defer cc.Shutdown()
+	defer cc.Shutdown(ctx)
 
-	c, _ := cid.Decode(test.TestCid2)
-	err := cc.LogUnpin(api.PinCid(c))
+	err := cc.LogUnpin(ctx, api.PinCid(test.Cid1))
 	if err != nil {
 		t.Error("the operation did not make it to the log:", err)
 	}
 }
 
 func TestConsensusUpdate(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	defer cleanRaft(1)
-	defer cc.Shutdown()
+	defer cc.Shutdown(ctx)
 
 	// Pin first
-	c1, _ := cid.Decode(test.TestCid1)
-	pin := testPin(c1)
+	pin := testPin(test.Cid1)
 	pin.Type = api.ShardType
-	err := cc.LogPin(pin)
+	err := cc.LogPin(ctx, pin)
 	if err != nil {
 		t.Fatal("the initial operation did not make it to the log:", err)
 	}
 	time.Sleep(250 * time.Millisecond)
 
 	// Update pin
-	c2, _ := cid.Decode(test.TestCid2)
-	pin.Reference = c2
-	err = cc.LogPin(pin)
+	pin.Reference = &test.Cid2
+	err = cc.LogPin(ctx, pin)
 	if err != nil {
 		t.Error("the update op did not make it to the log:", err)
 	}
 
 	time.Sleep(250 * time.Millisecond)
-	st, err := cc.State()
+	st, err := cc.State(ctx)
 	if err != nil {
 		t.Fatal("error getting state:", err)
 	}
 
-	pins := st.List()
-	if len(pins) != 1 || pins[0].Cid.String() != test.TestCid1 {
+	pins, err := st.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pins) != 1 || !pins[0].Cid.Equals(test.Cid1) {
 		t.Error("the added pin should be in the state")
 	}
-	if !pins[0].Reference.Equals(c2) {
+	if !pins[0].Reference.Equals(test.Cid2) {
 		t.Error("pin updated incorrectly")
 	}
 }
 
 func TestConsensusAddPeer(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	cc2 := testingConsensus(t, 2)
 	t.Log(cc.host.ID().Pretty())
 	t.Log(cc2.host.ID().Pretty())
 	defer cleanRaft(1)
 	defer cleanRaft(2)
-	defer cc.Shutdown()
-	defer cc2.Shutdown()
+	defer cc.Shutdown(ctx)
+	defer cc2.Shutdown(ctx)
 
 	cc.host.Peerstore().AddAddrs(cc2.host.ID(), cc2.host.Addrs(), peerstore.PermanentAddrTTL)
-	err := cc.AddPeer(cc2.host.ID())
+	err := cc.AddPeer(ctx, cc2.host.ID())
 	if err != nil {
 		t.Error("the operation did not make it to the log:", err)
 	}
@@ -177,7 +185,7 @@ func TestConsensusAddPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	peers, err := cc2.raft.Peers()
+	peers, err := cc2.raft.Peers(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,16 +196,17 @@ func TestConsensusAddPeer(t *testing.T) {
 }
 
 func TestConsensusRmPeer(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	cc2 := testingConsensus(t, 2)
 	defer cleanRaft(1)
 	defer cleanRaft(2)
-	defer cc.Shutdown()
-	defer cc2.Shutdown()
+	defer cc.Shutdown(ctx)
+	defer cc2.Shutdown(ctx)
 
 	cc.host.Peerstore().AddAddrs(cc2.host.ID(), cc2.host.Addrs(), peerstore.PermanentAddrTTL)
 
-	err := cc.AddPeer(cc2.host.ID())
+	err := cc.AddPeer(ctx, cc2.host.ID())
 	if err != nil {
 		t.Error("could not add peer:", err)
 	}
@@ -210,8 +219,7 @@ func TestConsensusRmPeer(t *testing.T) {
 	}
 	cc.raft.WaitForLeader(ctx)
 
-	c, _ := cid.Decode(test.TestCid1)
-	err = cc.LogPin(testPin(c))
+	err = cc.LogPin(ctx, testPin(test.Cid1))
 	if err != nil {
 		t.Error("could not pin after adding peer:", err)
 	}
@@ -219,16 +227,16 @@ func TestConsensusRmPeer(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Remove unexisting peer
-	err = cc.RmPeer(test.TestPeerID1)
+	err = cc.RmPeer(ctx, test.PeerID1)
 	if err != nil {
-		t.Error("the operation did not make it to the log:", err)
+		t.Fatal("the operation did not make it to the log:", err)
 	}
 
 	// Remove real peer. At least the leader can succeed
-	err = cc2.RmPeer(cc.host.ID())
-	err2 := cc.RmPeer(cc2.host.ID())
+	err = cc2.RmPeer(ctx, cc.host.ID())
+	err2 := cc.RmPeer(ctx, cc2.host.ID())
 	if err != nil && err2 != nil {
-		t.Error("could not remove peer:", err, err2)
+		t.Fatal("could not remove peer:", err, err2)
 	}
 
 	err = cc.raft.WaitForPeer(ctx, cc2.host.ID().Pretty(), true)
@@ -238,11 +246,12 @@ func TestConsensusRmPeer(t *testing.T) {
 }
 
 func TestConsensusLeader(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	pID := cc.host.ID()
 	defer cleanRaft(1)
-	defer cc.Shutdown()
-	l, err := cc.Leader()
+	defer cc.Shutdown(ctx)
+	l, err := cc.Leader(ctx)
 	if err != nil {
 		t.Fatal("No leader:", err)
 	}
@@ -253,13 +262,13 @@ func TestConsensusLeader(t *testing.T) {
 }
 
 func TestRaftLatestSnapshot(t *testing.T) {
+	ctx := context.Background()
 	cc := testingConsensus(t, 1)
 	defer cleanRaft(1)
-	defer cc.Shutdown()
+	defer cc.Shutdown(ctx)
 
 	// Make pin 1
-	c1, _ := cid.Decode(test.TestCid1)
-	err := cc.LogPin(testPin(c1))
+	err := cc.LogPin(ctx, testPin(test.Cid1))
 	if err != nil {
 		t.Error("the first pin did not make it to the log:", err)
 	}
@@ -271,8 +280,7 @@ func TestRaftLatestSnapshot(t *testing.T) {
 	}
 
 	// Make pin 2
-	c2, _ := cid.Decode(test.TestCid2)
-	err = cc.LogPin(testPin(c2))
+	err = cc.LogPin(ctx, testPin(test.Cid2))
 	if err != nil {
 		t.Error("the second pin did not make it to the log:", err)
 	}
@@ -284,8 +292,7 @@ func TestRaftLatestSnapshot(t *testing.T) {
 	}
 
 	// Make pin 3
-	c3, _ := cid.Decode(test.TestCid3)
-	err = cc.LogPin(testPin(c3))
+	err = cc.LogPin(ctx, testPin(test.Cid3))
 	if err != nil {
 		t.Error("the third pin did not make it to the log:", err)
 	}
@@ -297,7 +304,10 @@ func TestRaftLatestSnapshot(t *testing.T) {
 	}
 
 	// Call raft.LastState and ensure we get the correct state
-	snapState := mapstate.NewMapState()
+	snapState, err := dsstate.New(inmem.New(), "", dsstate.DefaultHandle())
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, snapExists, err := LastStateRaw(cc.config)
 	if !snapExists {
 		t.Fatal("No snapshot found by LastStateRaw")
@@ -305,11 +315,14 @@ func TestRaftLatestSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal("Error while taking snapshot", err)
 	}
-	err = snapState.Migrate(r)
+	err = snapState.Unmarshal(r)
 	if err != nil {
-		t.Fatal("Snapshot bytes returned could not restore to state")
+		t.Fatal("Snapshot bytes returned could not restore to state: ", err)
 	}
-	pins := snapState.List()
+	pins, err := snapState.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(pins) != 3 {
 		t.Fatal("Latest snapshot not read")
 	}

@@ -7,8 +7,8 @@
 [![standard-readme compliant](https://img.shields.io/badge/standard--readme-OK-green.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 [![GoDoc](https://godoc.org/github.com/ipfs/ipfs-cluster?status.svg)](https://godoc.org/github.com/ipfs/ipfs-cluster)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ipfs/ipfs-cluster)](https://goreportcard.com/report/github.com/ipfs/ipfs-cluster)
-[![Build Status](https://travis-ci.org/ipfs/ipfs-cluster.svg?branch=master)](https://travis-ci.org/ipfs/ipfs-cluster)
-[![Coverage Status](https://coveralls.io/repos/github/ipfs/ipfs-cluster/badge.svg?branch=master)](https://coveralls.io/github/ipfs/ipfs-cluster?branch=master)
+[![Build Status](https://travis-ci.com/ipfs/ipfs-cluster.svg?branch=master)](https://travis-ci.com/ipfs/ipfs-cluster)
+[![codecov](https://codecov.io/gh/ipfs/ipfs-cluster/branch/master/graph/badge.svg)](https://codecov.io/gh/ipfs/ipfs-cluster)
 
 > Pinset orchestration for IPFS.
 
@@ -53,7 +53,7 @@ The most up-to-date *Roadmap* is available at https://cluster.ipfs.io/roadmap/ .
 
 ## Install
 
-Instructions for different installation methods (including from source) are available at https://cluster.ipfs.io/documentation/download .
+Instructions for different installation methods (including from source) are available at https://cluster.ipfs.io/download .
 
 ## Usage
 
@@ -70,4 +70,6 @@ Small note: If editing the README, please conform to the [standard-readme](https
 
 ## License
 
-MIT © Protocol Labs, Inc.
+This library is dual-licensed under Apache 2.0 and MIT terms.
+
+© 2019. Protocol Labs, Inc.

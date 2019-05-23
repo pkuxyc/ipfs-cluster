@@ -2,18 +2,15 @@ package ipfshttp
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
+	"time"
 )
 
 var cfgJSON = []byte(`
 {
-      "proxy_listen_multiaddress": "/ip4/127.0.0.1/tcp/9095",
       "node_multiaddress": "/ip4/127.0.0.1/tcp/5001",
       "connect_swarms_delay": "7s",
-      "proxy_read_timeout": "10m0s",
-      "proxy_read_header_timeout": "5s",
-      "proxy_write_timeout": "10m0s",
-      "proxy_idle_timeout": "1m0s",
       "pin_method": "pin",
       "ipfs_request_timeout": "5m0s",
       "pin_timeout": "24h",
@@ -30,29 +27,11 @@ func TestLoadJSON(t *testing.T) {
 
 	j := &jsonConfig{}
 	json.Unmarshal(cfgJSON, j)
-	j.ProxyListenMultiaddress = "abc"
+	j.NodeMultiaddress = "abc"
 	tst, _ := json.Marshal(j)
 	err = cfg.LoadJSON(tst)
 	if err == nil {
-		t.Error("expected error decoding proxy_listen_multiaddress")
-	}
-
-	j = &jsonConfig{}
-	json.Unmarshal(cfgJSON, j)
-	j.NodeMultiaddress = "abc"
-	tst, _ = json.Marshal(j)
-	err = cfg.LoadJSON(tst)
-	if err == nil {
 		t.Error("expected error in node_multiaddress")
-	}
-
-	j = &jsonConfig{}
-	json.Unmarshal(cfgJSON, j)
-	j.ProxyReadTimeout = "-aber"
-	tst, _ = json.Marshal(j)
-	err = cfg.LoadJSON(tst)
-	if err == nil {
-		t.Error("expected error in proxy_read_timeout")
 	}
 }
 
@@ -81,34 +60,15 @@ func TestDefault(t *testing.T) {
 	if cfg.Validate() == nil {
 		t.Fatal("expected error validating")
 	}
+}
 
+func TestApplyEnvVar(t *testing.T) {
+	os.Setenv("CLUSTER_IPFSHTTP_PINTIMEOUT", "22m")
+	cfg := &Config{}
 	cfg.Default()
-	cfg.ProxyAddr = nil
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
-	}
+	cfg.ApplyEnvVars()
 
-	cfg.Default()
-	cfg.ProxyReadTimeout = -1
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
-	}
-
-	cfg.Default()
-	cfg.ProxyReadHeaderTimeout = -2
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
-	}
-
-	cfg.Default()
-	cfg.ProxyIdleTimeout = -1
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
-	}
-
-	cfg.Default()
-	cfg.ProxyWriteTimeout = -3
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
+	if cfg.PinTimeout != 22*time.Minute {
+		t.Fatal("failed to override pin_timeout with env var")
 	}
 }

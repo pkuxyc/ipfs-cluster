@@ -2,7 +2,7 @@
 
 # Sharness test framework for ipfs-cluster
 #
-# We are using sharness (https://github.com/mlafeldt/sharness)
+# We are using sharness (https://github.com/chriscool/sharness)
 # which was extracted from the Git test framework.
 
 SHARNESS_LIB="lib/sharness/sharness.sh"
@@ -84,14 +84,15 @@ test_cluster_init() {
 }
 
 test_cluster_config() {
-    export CLUSTER_CONFIG_PATH="test-config/service.json"
-    export CLUSTER_CONFIG_ID=`jq --raw-output ".cluster.id" $CLUSTER_CONFIG_PATH`
-    export CLUSTER_CONFIG_PK=`jq --raw-output ".cluster.private_key" $CLUSTER_CONFIG_PATH`
-    [ "$CLUSTER_CONFIG_ID" != "null" ] && [ "$CLUSTER_CONFIG_PK" != "null" ]
+    # export CLUSTER_CONFIG_PATH="test-config/service.json"
+    export CLUSTER_IDENTITY_PATH="test-config/identity.json"
+    export CLUSTER_IDENTITY_ID=`jq --raw-output ".id" $CLUSTER_IDENTITY_PATH`
+    export CLUSTER_IDENTITY_PK=`jq --raw-output ".private_key" $CLUSTER_IDENTITY_PATH`
+    [ "$CLUSTER_IDENTITY_ID" != "null" ] && [ "$CLUSTER_IDENTITY_PK" != "null" ]
 }
 
 cluster_id() {
-    jq --raw-output ".cluster.id" test-config/service.json
+    jq --raw-output ".id" test-config/identity.json
 }
 
 test_confirm_v1State() {

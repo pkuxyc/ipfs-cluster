@@ -1,7 +1,11 @@
 package raft
 
 import (
+	"context"
 	"errors"
+
+	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 
 	"github.com/ipfs/ipfs-cluster/api"
 	"github.com/ipfs/ipfs-cluster/state"
@@ -22,53 +26,72 @@ type LogOpType int
 // It implements the consensus.Op interface and it is used by the
 // Consensus component.
 type LogOp struct {
-	Cid       api.PinSerial
-	Type      LogOpType
-	consensus *Consensus
+	SpanCtx   trace.SpanContext `codec:"s,omitempty"`
+	TagCtx    []byte            `codec:"t,omitempty"`
+	Cid       *api.Pin          `codec:"c,omitempty"`
+	Type      LogOpType         `codec:"p,omitempty"`
+	consensus *Consensus        `codec:"-"`
+	tracing   bool              `codec:"-"`
 }
 
 // ApplyTo applies the operation to the State
 func (op *LogOp) ApplyTo(cstate consensus.State) (consensus.State, error) {
-	state, ok := cstate.(state.State)
 	var err error
+	ctx := context.Background()
+	if op.tracing {
+		tagmap, err := tag.Decode(op.TagCtx)
+		if err != nil {
+			logger.Error(err)
+		}
+		ctx = tag.NewContext(ctx, tagmap)
+		var span *trace.Span
+		ctx, span = trace.StartSpanWithRemoteParent(ctx, "consensus/raft/logop/ApplyTo", op.SpanCtx)
+		defer span.End()
+	}
+
+	state, ok := cstate.(state.State)
 	if !ok {
 		// Should never be here
 		panic("received unexpected state type")
 	}
 
-	// Copy the Cid. We are about to pass it to go-routines
-	// that will make things with it (read its fields). However,
-	// as soon as ApplyTo is done, the next operation will be deserealized
-	// on top of "op". This can cause data races with the slices in
-	// api.PinSerial, which don't get copied when passed.
-	pinS := op.Cid.Clone()
+	pin := op.Cid
+	// We are about to pass "pin" it to go-routines that will make things
+	// with it (read its fields). However, as soon as ApplyTo is done, the
+	// next operation will be deserealized on top of "op". We nullify it
+	// to make sure no data races occur.
+	op.Cid = nil
 
 	switch op.Type {
 	case LogOpPin:
-		err = state.Add(pinS.ToPin())
+		err = state.Add(ctx, pin)
 		if err != nil {
+			logger.Error(err)
 			goto ROLLBACK
 		}
 		// Async, we let the PinTracker take care of any problems
-		op.consensus.rpcClient.Go(
+		op.consensus.rpcClient.GoContext(
+			ctx,
 			"",
-			"Cluster",
+			"PinTracker",
 			"Track",
-			pinS,
+			pin,
 			&struct{}{},
 			nil,
 		)
 	case LogOpUnpin:
-		err = state.Rm(pinS.DecodeCid())
+		err = state.Rm(ctx, pin.Cid)
 		if err != nil {
+			logger.Error(err)
 			goto ROLLBACK
 		}
 		// Async, we let the PinTracker take care of any problems
-		op.consensus.rpcClient.Go(
+		op.consensus.rpcClient.GoContext(
+			ctx,
 			"",
-			"Cluster",
+			"PinTracker",
 			"Untrack",
-			pinS,
+			pin,
 			&struct{}{},
 			nil,
 		)

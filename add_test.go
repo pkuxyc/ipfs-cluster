@@ -3,6 +3,7 @@ package ipfscluster
 // This files has tests for Add* using multiple cluster peers.
 
 import (
+	"context"
 	"mime/multipart"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 )
 
 func TestAdd(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	sth := test.NewShardingTestHelper()
@@ -34,12 +36,12 @@ func TestAdd(t *testing.T) {
 		pinDelay()
 
 		f := func(t *testing.T, c *Cluster) {
-			pin := c.StatusLocal(ci)
+			pin := c.StatusLocal(ctx, ci)
 			if pin.Error != "" {
 				t.Error(pin.Error)
 			}
 			if pin.Status != api.TrackerStatusPinned {
-				t.Error("item should be pinned")
+				t.Error("item should be pinned and is", pin.Status)
 			}
 		}
 
@@ -48,12 +50,12 @@ func TestAdd(t *testing.T) {
 }
 
 func TestAddPeerDown(t *testing.T) {
+	ctx := context.Background()
 	clusters, mock := createClusters(t)
 	defer shutdownClusters(t, clusters, mock)
 	sth := test.NewShardingTestHelper()
 	defer sth.Clean(t)
-
-	err := clusters[0].Shutdown()
+	err := clusters[0].Shutdown(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +83,7 @@ func TestAddPeerDown(t *testing.T) {
 			if c.id == clusters[0].id {
 				return
 			}
-
-			pin := c.StatusLocal(ci)
+			pin := c.StatusLocal(ctx, ci)
 			if pin.Error != "" {
 				t.Error(pin.Error)
 			}

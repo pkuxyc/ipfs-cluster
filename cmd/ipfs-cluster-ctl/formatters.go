@@ -8,59 +8,31 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ipfs/ipfs-cluster/api"
 	peer "github.com/libp2p/go-libp2p-peer"
+
+	"github.com/ipfs/ipfs-cluster/api"
 )
+
+type addedOutputQuiet struct {
+	*api.AddedOutput
+	quiet bool
+}
 
 func jsonFormatObject(resp interface{}) {
 	switch resp.(type) {
 	case nil:
 		return
-	case api.ID:
-		jsonFormatPrint(resp.(api.ID).ToSerial())
-	case api.GlobalPinInfo:
-		jsonFormatPrint(resp.(api.GlobalPinInfo).ToSerial())
-	case api.Pin:
-		jsonFormatPrint(resp.(api.Pin).ToSerial())
-	case api.AddedOutput:
-		jsonFormatPrint(resp.(api.AddedOutput))
-	case api.Version:
-		jsonFormatPrint(resp.(api.Version))
-	case api.Metric:
-		serial := resp.(api.Metric)
-		textFormatPrintMetric(&serial)
-	case api.Error:
-		jsonFormatPrint(resp.(api.Error))
-	case []api.ID:
-		r := resp.([]api.ID)
-		serials := make([]api.IDSerial, len(r), len(r))
-		for i, item := range r {
-			serials[i] = item.ToSerial()
+	case []*addedOutputQuiet:
+		// print original objects as in JSON it makes
+		// no sense to have a human "quiet" output
+		serials := resp.([]*addedOutputQuiet)
+		var actual []*api.AddedOutput
+		for _, s := range serials {
+			actual = append(actual, s.AddedOutput)
 		}
-		jsonFormatPrint(serials)
-
-	case []api.GlobalPinInfo:
-		r := resp.([]api.GlobalPinInfo)
-		serials := make([]api.GlobalPinInfoSerial, len(r), len(r))
-		for i, item := range r {
-			serials[i] = item.ToSerial()
-		}
-		jsonFormatPrint(serials)
-	case []api.Pin:
-		r := resp.([]api.Pin)
-		serials := make([]api.PinSerial, len(r), len(r))
-		for i, item := range r {
-			serials[i] = item.ToSerial()
-		}
-		jsonFormatPrint(serials)
-	case []api.AddedOutput:
-		serials := resp.([]api.AddedOutput)
-		jsonFormatPrint(serials)
-	case []api.Metric:
-		serials := resp.([]api.Metric)
-		jsonFormatPrint(serials)
+		jsonFormatPrint(actual)
 	default:
-		checkErr("", errors.New("unsupported type returned"))
+		jsonFormatPrint(resp)
 	}
 }
 
@@ -74,45 +46,44 @@ func textFormatObject(resp interface{}) {
 	switch resp.(type) {
 	case nil:
 		return
-	case api.ID:
-		serial := resp.(api.ID).ToSerial()
-		textFormatPrintIDSerial(&serial)
-	case api.GlobalPinInfo:
-		serial := resp.(api.GlobalPinInfo).ToSerial()
-		textFormatPrintGPInfo(&serial)
-	case api.Pin:
-		serial := resp.(api.Pin).ToSerial()
-		textFormatPrintPin(&serial)
-	case api.AddedOutput:
-		serial := resp.(api.AddedOutput)
-		textFormatPrintAddedOutput(&serial)
-	case api.Version:
-		serial := resp.(api.Version)
-		textFormatPrintVersion(&serial)
-	case api.Error:
-		serial := resp.(api.Error)
-		textFormatPrintError(&serial)
-	case api.Metric:
-		serial := resp.(api.Metric)
-		textFormatPrintMetric(&serial)
-	case []api.ID:
-		for _, item := range resp.([]api.ID) {
+	case *api.ID:
+		textFormatPrintID(resp.(*api.ID))
+	case *api.GlobalPinInfo:
+		textFormatPrintGPInfo(resp.(*api.GlobalPinInfo))
+	case *api.Pin:
+		textFormatPrintPin(resp.(*api.Pin))
+	case *api.AddedOutput:
+		textFormatPrintAddedOutput(resp.(*api.AddedOutput))
+	case *addedOutputQuiet:
+		textFormatPrintAddedOutputQuiet(resp.(*addedOutputQuiet))
+	case *api.Version:
+		textFormatPrintVersion(resp.(*api.Version))
+	case *api.Error:
+		textFormatPrintError(resp.(*api.Error))
+	case *api.Metric:
+		textFormatPrintMetric(resp.(*api.Metric))
+	case []*api.ID:
+		for _, item := range resp.([]*api.ID) {
 			textFormatObject(item)
 		}
-	case []api.GlobalPinInfo:
-		for _, item := range resp.([]api.GlobalPinInfo) {
+	case []*api.GlobalPinInfo:
+		for _, item := range resp.([]*api.GlobalPinInfo) {
 			textFormatObject(item)
 		}
-	case []api.Pin:
-		for _, item := range resp.([]api.Pin) {
+	case []*api.Pin:
+		for _, item := range resp.([]*api.Pin) {
 			textFormatObject(item)
 		}
-	case []api.AddedOutput:
-		for _, item := range resp.([]api.AddedOutput) {
+	case []*api.AddedOutput:
+		for _, item := range resp.([]*api.AddedOutput) {
 			textFormatObject(item)
 		}
-	case []api.Metric:
-		for _, item := range resp.([]api.Metric) {
+	case []*addedOutputQuiet:
+		for _, item := range resp.([]*addedOutputQuiet) {
+			textFormatObject(item)
+		}
+	case []*api.Metric:
+		for _, item := range resp.([]*api.Metric) {
 			textFormatObject(item)
 		}
 	default:
@@ -120,16 +91,22 @@ func textFormatObject(resp interface{}) {
 	}
 }
 
-func textFormatPrintIDSerial(obj *api.IDSerial) {
+func textFormatPrintID(obj *api.ID) {
 	if obj.Error != "" {
-		fmt.Printf("%s | ERROR: %s\n", obj.ID, obj.Error)
+		fmt.Printf("%s | ERROR: %s\n", obj.ID.Pretty(), obj.Error)
 		return
 	}
 
-	fmt.Printf("%s | %s | Sees %d other peers\n", obj.ID, obj.Peername, len(obj.ClusterPeers)-1)
+	fmt.Printf(
+		"%s | %s | Sees %d other peers\n",
+		obj.ID.Pretty(),
+		obj.Peername,
+		len(obj.ClusterPeers)-1,
+	)
+
 	addrs := make(sort.StringSlice, 0, len(obj.Addresses))
 	for _, a := range obj.Addresses {
-		addrs = append(addrs, string(a))
+		addrs = append(addrs, a.String())
 	}
 	addrs.Sort()
 	fmt.Println("  > Addresses:")
@@ -143,42 +120,43 @@ func textFormatPrintIDSerial(obj *api.IDSerial) {
 
 	ipfsAddrs := make(sort.StringSlice, 0, len(obj.Addresses))
 	for _, a := range obj.IPFS.Addresses {
-		ipfsAddrs = append(ipfsAddrs, string(a))
+		ipfsAddrs = append(ipfsAddrs, a.String())
 	}
 	ipfsAddrs.Sort()
-	fmt.Printf("  > IPFS: %s\n", obj.IPFS.ID)
+	fmt.Printf("  > IPFS: %s\n", obj.IPFS.ID.Pretty())
 	for _, a := range ipfsAddrs {
 		fmt.Printf("    - %s\n", a)
 	}
 }
 
-func textFormatPrintGPInfo(obj *api.GlobalPinInfoSerial) {
+func textFormatPrintGPInfo(obj *api.GlobalPinInfo) {
 	fmt.Printf("%s :\n", obj.Cid)
-	peers := make(sort.StringSlice, 0, len(obj.PeerMap))
+	peers := make([]string, 0, len(obj.PeerMap))
 	for k := range obj.PeerMap {
 		peers = append(peers, k)
 	}
-	peers.Sort()
+	sort.Strings(peers)
 
 	for _, k := range peers {
 		v := obj.PeerMap[k]
 		if len(v.PeerName) > 0 {
-			fmt.Printf("    > %-15s : %s", v.PeerName, strings.ToUpper(v.Status))
+			fmt.Printf("    > %-15s : %s", v.PeerName, strings.ToUpper(v.Status.String()))
 		} else {
-			fmt.Printf("    > %-15s : %s", k, strings.ToUpper(v.Status))
+			fmt.Printf("    > %-15s : %s", k, strings.ToUpper(v.Status.String()))
 		}
 		if v.Error != "" {
 			fmt.Printf(": %s", v.Error)
 		}
-		fmt.Printf(" | %s\n", v.TS)
+		txt, _ := v.TS.MarshalText()
+		fmt.Printf(" | %s\n", txt)
 	}
 }
 
-func textFormatPrintPInfo(obj *api.PinInfoSerial) {
-	gpinfo := api.GlobalPinInfoSerial{
+func textFormatPrintPInfo(obj *api.PinInfo) {
+	gpinfo := api.GlobalPinInfo{
 		Cid: obj.Cid,
-		PeerMap: map[string]api.PinInfoSerial{
-			obj.Peer: *obj,
+		PeerMap: map[string]*api.PinInfo{
+			peer.IDB58Encode(obj.Peer): obj,
 		},
 	}
 	textFormatPrintGPInfo(&gpinfo)
@@ -188,14 +166,14 @@ func textFormatPrintVersion(obj *api.Version) {
 	fmt.Println(obj.Version)
 }
 
-func textFormatPrintPin(obj *api.PinSerial) {
-	fmt.Printf("%s | %s | %s | ", obj.Cid, obj.Name, strings.ToUpper(obj.ToPin().Type.String()))
+func textFormatPrintPin(obj *api.Pin) {
+	fmt.Printf("%s | %s | %s | ", obj.Cid, obj.Name, strings.ToUpper(obj.Type.String()))
 
 	if obj.ReplicationFactorMin < 0 {
 		fmt.Printf("Repl. Factor: -1 | Allocations: [everywhere]")
 	} else {
-		var sortAlloc sort.StringSlice = obj.Allocations
-		sortAlloc.Sort()
+		sortAlloc := api.PeersToStrings(obj.Allocations)
+		sort.Strings(sortAlloc)
 		fmt.Printf("Repl. Factor: %d--%d | Allocations: %s",
 			obj.ReplicationFactorMin, obj.ReplicationFactorMax,
 			sortAlloc)
@@ -217,6 +195,14 @@ func textFormatPrintAddedOutput(obj *api.AddedOutput) {
 	fmt.Printf("added %s %s\n", obj.Cid, obj.Name)
 }
 
+func textFormatPrintAddedOutputQuiet(obj *addedOutputQuiet) {
+	if obj.quiet {
+		fmt.Printf("%s\n", obj.AddedOutput.Cid)
+	} else {
+		textFormatPrintAddedOutput(obj.AddedOutput)
+	}
+}
+
 func textFormatPrintMetric(obj *api.Metric) {
 	date := time.Unix(0, obj.Expire).UTC().Format(time.RFC3339)
 	fmt.Printf("%s: %s | Expire: %s\n", peer.IDB58Encode(obj.Peer), obj.Value, date)
@@ -226,4 +212,14 @@ func textFormatPrintError(obj *api.Error) {
 	fmt.Printf("An error occurred:\n")
 	fmt.Printf("  Code: %d\n", obj.Code)
 	fmt.Printf("  Message: %s\n", obj.Message)
+}
+
+func trackerStatusAllString() string {
+	var strs []string
+	for _, st := range api.TrackerStatusAll() {
+		strs = append(strs, "  - "+st.String())
+	}
+
+	sort.Strings(strs)
+	return strings.Join(strs, "\n")
 }

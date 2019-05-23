@@ -17,37 +17,39 @@ type badRPCService struct {
 func badRPCClient(t *testing.T) *rpc.Client {
 	s := rpc.NewServer(nil, "mock")
 	c := rpc.NewClientWithServer(nil, "mock", s)
-	err := s.RegisterName("Cluster", &badRPCService{})
+	err := s.RegisterName("IPFSConnector", &badRPCService{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
 }
 
-func (mock *badRPCService) IPFSRepoStat(ctx context.Context, in struct{}, out *api.IPFSRepoStat) error {
+func (mock *badRPCService) RepoStat(ctx context.Context, in struct{}, out *api.IPFSRepoStat) error {
 	return errors.New("fake error")
 }
 
 func Test(t *testing.T) {
+	ctx := context.Background()
 	cfg := &Config{}
 	cfg.Default()
 	inf, err := NewInformer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inf.Shutdown()
-	m := inf.GetMetric()
+	defer inf.Shutdown(ctx)
+	m := inf.GetMetric(ctx)
 	if m.Valid {
 		t.Error("metric should be invalid")
 	}
 	inf.SetClient(test.NewMockRPCClient(t))
-	m = inf.GetMetric()
+	m = inf.GetMetric(ctx)
 	if !m.Valid {
 		t.Error("metric should be valid")
 	}
 }
 
 func TestFreeSpace(t *testing.T) {
+	ctx := context.Background()
 	cfg := &Config{}
 	cfg.Default()
 	cfg.Type = MetricFreeSpace
@@ -56,13 +58,13 @@ func TestFreeSpace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inf.Shutdown()
-	m := inf.GetMetric()
+	defer inf.Shutdown(ctx)
+	m := inf.GetMetric(ctx)
 	if m.Valid {
 		t.Error("metric should be invalid")
 	}
 	inf.SetClient(test.NewMockRPCClient(t))
-	m = inf.GetMetric()
+	m = inf.GetMetric(ctx)
 	if !m.Valid {
 		t.Error("metric should be valid")
 	}
@@ -73,6 +75,7 @@ func TestFreeSpace(t *testing.T) {
 }
 
 func TestRepoSize(t *testing.T) {
+	ctx := context.Background()
 	cfg := &Config{}
 	cfg.Default()
 	cfg.Type = MetricRepoSize
@@ -81,13 +84,13 @@ func TestRepoSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inf.Shutdown()
-	m := inf.GetMetric()
+	defer inf.Shutdown(ctx)
+	m := inf.GetMetric(ctx)
 	if m.Valid {
 		t.Error("metric should be invalid")
 	}
 	inf.SetClient(test.NewMockRPCClient(t))
-	m = inf.GetMetric()
+	m = inf.GetMetric(ctx)
 	if !m.Valid {
 		t.Error("metric should be valid")
 	}
@@ -98,15 +101,16 @@ func TestRepoSize(t *testing.T) {
 }
 
 func TestWithErrors(t *testing.T) {
+	ctx := context.Background()
 	cfg := &Config{}
 	cfg.Default()
 	inf, err := NewInformer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer inf.Shutdown()
+	defer inf.Shutdown(ctx)
 	inf.SetClient(badRPCClient(t))
-	m := inf.GetMetric()
+	m := inf.GetMetric(ctx)
 	if m.Valid {
 		t.Errorf("metric should be invalid")
 	}

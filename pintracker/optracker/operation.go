@@ -2,12 +2,15 @@ package optracker
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	cid "github.com/ipfs/go-cid"
 
 	"github.com/ipfs/ipfs-cluster/api"
+	"go.opencensus.io/trace"
 )
 
 //go:generate stringer -type=OperationType
@@ -55,7 +58,7 @@ type Operation struct {
 
 	// RO fields
 	opType OperationType
-	pin    api.Pin
+	pin    *api.Pin
 
 	// RW fields
 	mu    sync.RWMutex
@@ -65,7 +68,10 @@ type Operation struct {
 }
 
 // NewOperation creates a new Operation.
-func NewOperation(ctx context.Context, pin api.Pin, typ OperationType, ph Phase) *Operation {
+func NewOperation(ctx context.Context, pin *api.Pin, typ OperationType, ph Phase) *Operation {
+	ctx, span := trace.StartSpan(ctx, "optracker/NewOperation")
+	defer span.End()
+
 	ctx, cancel := context.WithCancel(ctx)
 	return &Operation{
 		ctx:    ctx,
@@ -77,6 +83,24 @@ func NewOperation(ctx context.Context, pin api.Pin, typ OperationType, ph Phase)
 		ts:     time.Now(),
 		error:  "",
 	}
+}
+
+// String returns a string representation of an Operation.
+func (op *Operation) String() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "type: %s\n", op.Type().String())
+	fmt.Fprint(&b, "pin:\n")
+	pinstr := op.Pin().String()
+	pinstrs := strings.Split(pinstr, "\n")
+	for _, s := range pinstrs {
+		fmt.Fprintf(&b, "\t%s\n", s)
+	}
+	fmt.Fprintf(&b, "phase: %s\n", op.Phase().String())
+	fmt.Fprintf(&b, "error: %s\n", op.Error())
+	fmt.Fprintf(&b, "timestamp: %s\n", op.Timestamp().String())
+
+	return b.String()
 }
 
 // Cid returns the Cid associated to this operation.
@@ -93,6 +117,9 @@ func (op *Operation) Context() context.Context {
 
 // Cancel will cancel the context associated to this operation.
 func (op *Operation) Cancel() {
+	ctx, span := trace.StartSpan(op.ctx, "optracker/Cancel")
+	_ = ctx
+	defer span.End()
 	op.cancel()
 }
 
@@ -105,6 +132,9 @@ func (op *Operation) Phase() Phase {
 
 // SetPhase changes the Phase and updates the timestamp.
 func (op *Operation) SetPhase(ph Phase) {
+	ctx, span := trace.StartSpan(op.ctx, "optracker/SetPhase")
+	_ = ctx
+	defer span.End()
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	op.phase = ph
@@ -121,6 +151,9 @@ func (op *Operation) Error() string {
 // SetError sets the phase to PhaseError along with
 // an error message. It updates the timestamp.
 func (op *Operation) SetError(err error) {
+	ctx, span := trace.StartSpan(op.ctx, "optracker/SetError")
+	_ = ctx
+	defer span.End()
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	op.phase = PhaseError
@@ -134,7 +167,7 @@ func (op *Operation) Type() OperationType {
 }
 
 // Pin returns the Pin object associated to the operation.
-func (op *Operation) Pin() api.Pin {
+func (op *Operation) Pin() *api.Pin {
 	return op.pin
 }
 
@@ -149,6 +182,9 @@ func (op *Operation) Timestamp() time.Time {
 // Cancelled returns whether the context for this
 // operation has been cancelled.
 func (op *Operation) Cancelled() bool {
+	ctx, span := trace.StartSpan(op.ctx, "optracker/Cancelled")
+	_ = ctx
+	defer span.End()
 	select {
 	case <-op.ctx.Done():
 		return true
@@ -175,7 +211,7 @@ func (op *Operation) ToTrackerStatus() api.TrackerStatus {
 		case PhaseDone:
 			return api.TrackerStatusPinned
 		default:
-			return api.TrackerStatusBug
+			return api.TrackerStatusUndefined
 		}
 	case OperationUnpin:
 		switch ph {
@@ -188,14 +224,14 @@ func (op *Operation) ToTrackerStatus() api.TrackerStatus {
 		case PhaseDone:
 			return api.TrackerStatusUnpinned
 		default:
-			return api.TrackerStatusBug
+			return api.TrackerStatusUndefined
 		}
 	case OperationRemote:
 		return api.TrackerStatusRemote
 	case OperationShard:
 		return api.TrackerStatusSharded
 	default:
-		return api.TrackerStatusBug
+		return api.TrackerStatusUndefined
 	}
 
 }

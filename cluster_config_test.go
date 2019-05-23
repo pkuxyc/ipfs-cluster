@@ -87,13 +87,6 @@ func TestLoadJSON(t *testing.T) {
 		return cfg, nil
 	}
 
-	t.Run("bad id", func(t *testing.T) {
-		_, err := loadJSON2(t, func(j *configJSON) { j.ID = "abc" })
-		if err == nil {
-			t.Error("expected error decoding ID")
-		}
-	})
-
 	t.Run("empty default peername", func(t *testing.T) {
 		cfg, err := loadJSON2(t, func(j *configJSON) { j.Peername = "" })
 		if err != nil {
@@ -101,13 +94,6 @@ func TestLoadJSON(t *testing.T) {
 		}
 		if cfg.Peername == "" {
 			t.Error("expected default peername")
-		}
-	})
-
-	t.Run("bad private key", func(t *testing.T) {
-		_, err := loadJSON2(t, func(j *configJSON) { j.PrivateKey = "abc" })
-		if err == nil {
-			t.Error("expected error parsing private key")
 		}
 	})
 
@@ -129,7 +115,6 @@ func TestLoadJSON(t *testing.T) {
 		cfg, err := loadJSON2(
 			t,
 			func(j *configJSON) {
-				j.ReplicationFactor = 0
 				j.ReplicationFactorMin = 0
 				j.ReplicationFactorMax = 0
 			},
@@ -139,16 +124,6 @@ func TestLoadJSON(t *testing.T) {
 		}
 		if cfg.ReplicationFactorMin != -1 || cfg.ReplicationFactorMax != -1 {
 			t.Error("expected default replication factor")
-		}
-	})
-
-	t.Run("replication factor min/max override", func(t *testing.T) {
-		cfg, err := loadJSON2(t, func(j *configJSON) { j.ReplicationFactor = 3 })
-		if err != nil {
-			t.Error(err)
-		}
-		if cfg.ReplicationFactorMin != 3 || cfg.ReplicationFactorMax != 3 {
-			t.Error("expected replicationFactor Min/Max override")
 		}
 	})
 
@@ -187,15 +162,6 @@ func TestLoadJSON(t *testing.T) {
 			t.Error("expected default replication factors")
 		}
 	})
-
-	t.Run("env var override", func(t *testing.T) {
-		os.Setenv("CLUSTER_PEERNAME", "envsetpeername")
-		cfg := &Config{}
-		cfg.LoadJSON(ccfgTestJSON)
-		if cfg.Peername != "envsetpeername" {
-			t.Fatal("failed to override peername with env var")
-		}
-	})
 }
 
 func TestToJSON(t *testing.T) {
@@ -220,13 +186,18 @@ func TestDefault(t *testing.T) {
 	}
 }
 
-func TestValidate(t *testing.T) {
+func TestApplyEnvVars(t *testing.T) {
+	os.Setenv("CLUSTER_PEERNAME", "envsetpeername")
 	cfg := &Config{}
 	cfg.Default()
-	cfg.ID = ""
-	if cfg.Validate() == nil {
-		t.Fatal("expected error validating")
+	cfg.ApplyEnvVars()
+	if cfg.Peername != "envsetpeername" {
+		t.Fatal("failed to override peername with env var")
 	}
+}
+
+func TestValidate(t *testing.T) {
+	cfg := &Config{}
 
 	cfg.Default()
 	cfg.MonitorPingInterval = 0

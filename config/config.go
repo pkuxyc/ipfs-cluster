@@ -1,5 +1,5 @@
 // Package config provides interfaces and utilities for different Cluster
-// components to register, read,  write and validate configuration sections
+// components to register, read, write and validate configuration sections
 // stored in a central configuration file.
 package config
 
@@ -34,6 +34,8 @@ type ComponentConfig interface {
 	ToJSON() ([]byte, error)
 	// Sets default working values
 	Default() error
+	// Sets values from environment variables
+	ApplyEnvVars() error
 	// Allows this component to work under a subfolder
 	SetBaseDir(string)
 	// Checks that the configuration is valid
@@ -46,7 +48,7 @@ type ComponentConfig interface {
 // These are the component configuration types
 // supported by the Manager.
 const (
-	Cluster = iota
+	Cluster SectionType = iota
 	Consensus
 	API
 	IPFSConn
@@ -55,11 +57,22 @@ const (
 	Monitor
 	Allocator
 	Informer
-	Sharder
+	Observations
+	Datastore
+	endTypes // keep this at the end
 )
 
 // SectionType specifies to which section a component configuration belongs.
 type SectionType int
+
+// SectionTypes returns the list of supported SectionTypes
+func SectionTypes() []SectionType {
+	var l []SectionType
+	for i := Cluster; i < endTypes; i++ {
+		l = append(l, i)
+	}
+	return l
+}
 
 // Section is a section of which stores
 // component-specific configurations.
@@ -156,16 +169,44 @@ func (cfg *Manager) watchSave(save <-chan struct{}) {
 // saved using json. Most configuration keys are converted into simple types
 // like strings, and key names aim to be self-explanatory for the user.
 type jsonConfig struct {
-	Cluster    *json.RawMessage `json:"cluster"`
-	Consensus  jsonSection      `json:"consensus,omitempty"`
-	API        jsonSection      `json:"api,omitempty"`
-	IPFSConn   jsonSection      `json:"ipfs_connector,omitempty"`
-	State      jsonSection      `json:"state,omitempty"`
-	PinTracker jsonSection      `json:"pin_tracker,omitempty"`
-	Monitor    jsonSection      `json:"monitor,omitempty"`
-	Allocator  jsonSection      `json:"allocator,omitempty"`
-	Informer   jsonSection      `json:"informer,omitempty"`
-	Sharder    jsonSection      `json:"sharder,omitempty"`
+	Cluster      *json.RawMessage `json:"cluster"`
+	Consensus    jsonSection      `json:"consensus,omitempty"`
+	API          jsonSection      `json:"api,omitempty"`
+	IPFSConn     jsonSection      `json:"ipfs_connector,omitempty"`
+	State        jsonSection      `json:"state,omitempty"`
+	PinTracker   jsonSection      `json:"pin_tracker,omitempty"`
+	Monitor      jsonSection      `json:"monitor,omitempty"`
+	Allocator    jsonSection      `json:"allocator,omitempty"`
+	Informer     jsonSection      `json:"informer,omitempty"`
+	Observations jsonSection      `json:"observations,omitempty"`
+	Datastore    jsonSection      `json:"datastore,omitempty"`
+}
+
+func (jcfg *jsonConfig) getSection(i SectionType) *jsonSection {
+	switch i {
+	case Consensus:
+		return &jcfg.Consensus
+	case API:
+		return &jcfg.API
+	case IPFSConn:
+		return &jcfg.IPFSConn
+	case State:
+		return &jcfg.State
+	case PinTracker:
+		return &jcfg.PinTracker
+	case Monitor:
+		return &jcfg.Monitor
+	case Allocator:
+		return &jcfg.Allocator
+	case Informer:
+		return &jcfg.Informer
+	case Observations:
+		return &jcfg.Observations
+	case Datastore:
+		return &jcfg.Datastore
+	default:
+		return nil
+	}
 }
 
 // Default generates a default configuration by generating defaults for all
@@ -187,6 +228,30 @@ func (cfg *Manager) Default() error {
 			return err
 		}
 	}
+	return nil
+}
+
+// ApplyEnvVars overrides configuration fields with any values found
+// in environment variables.
+func (cfg *Manager) ApplyEnvVars() error {
+	for _, section := range cfg.sections {
+		for k, compcfg := range section {
+			logger.Debugf("applying environment variables conf for %s", k)
+			err := compcfg.ApplyEnvVars()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if cfg.clusterConfig != nil {
+		logger.Debugf("applying environment variables conf for cluster")
+		err := cfg.clusterConfig.ApplyEnvVars()
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -261,6 +326,17 @@ func (cfg *Manager) LoadJSONFromFile(path string) error {
 	return err
 }
 
+// LoadJSONFileAndEnv calls LoadJSONFromFile followed by ApplyEnvVars,
+// reading and parsing a Configuration file and then overriding fields
+// with any values found in environment variables.
+func (cfg *Manager) LoadJSONFileAndEnv(path string) error {
+	if err := cfg.LoadJSONFromFile(path); err != nil {
+		return err
+	}
+
+	return cfg.ApplyEnvVars()
+}
+
 // LoadJSON parses configurations for all registered components,
 // In order to work, component configurations must have been registered
 // beforehand with RegisterComponent.
@@ -279,25 +355,36 @@ func (cfg *Manager) LoadJSON(bs []byte) error {
 	// Load Cluster section. Needs to have been registered
 	if cfg.clusterConfig != nil && jcfg.Cluster != nil {
 		cfg.clusterConfig.SetBaseDir(dir)
-		cfg.clusterConfig.LoadJSON([]byte(*jcfg.Cluster))
+		err = cfg.clusterConfig.LoadJSON([]byte(*jcfg.Cluster))
+		if err != nil {
+			return err
+		}
 	}
 
+	loadCompJSON := func(name string, component ComponentConfig, jsonSection jsonSection) error {
+		raw, ok := jsonSection[name]
+		if ok {
+			component.SetBaseDir(dir)
+			err := component.LoadJSON([]byte(*raw))
+			if err != nil {
+				return err
+			}
+			logger.Debugf("%s section configuration loaded", name)
+		} else {
+			logger.Warningf("%s section is empty, generating default", name)
+			component.SetBaseDir(dir)
+			component.Default()
+		}
+
+		return nil
+	}
 	// Helper function to load json from each section in the json config
-	loadCompJSON := func(section Section, jsonSection jsonSection) error {
+	loadSectionJSON := func(section Section, jsonSection jsonSection) error {
 		for name, component := range section {
-			raw, ok := jsonSection[name]
-			if ok {
-				component.SetBaseDir(dir)
-				err := component.LoadJSON([]byte(*raw))
-				if err != nil {
-					logger.Error(err)
-					return err
-				}
-				logger.Debugf("%s section configuration loaded", name)
-			} else {
-				logger.Warningf("%s section is empty, generating default", name)
-				component.SetBaseDir(dir)
-				component.Default()
+			err := loadCompJSON(name, component, jsonSection)
+			if err != nil {
+				logger.Error(err)
+				return err
 			}
 		}
 		return nil
@@ -305,16 +392,17 @@ func (cfg *Manager) LoadJSON(bs []byte) error {
 	}
 
 	sections := cfg.sections
-	// will skip checking errors and trust Validate()
-	loadCompJSON(sections[Consensus], jcfg.Consensus)
-	loadCompJSON(sections[API], jcfg.API)
-	loadCompJSON(sections[IPFSConn], jcfg.IPFSConn)
-	loadCompJSON(sections[State], jcfg.State)
-	loadCompJSON(sections[PinTracker], jcfg.PinTracker)
-	loadCompJSON(sections[Monitor], jcfg.Monitor)
-	loadCompJSON(sections[Allocator], jcfg.Allocator)
-	loadCompJSON(sections[Informer], jcfg.Informer)
-	loadCompJSON(sections[Sharder], jcfg.Informer)
+
+	for _, t := range SectionTypes() {
+		if t == Cluster {
+			continue
+		}
+		err := loadSectionJSON(sections[t], *jcfg.getSection(t))
+		if err != nil {
+			return err
+		}
+	}
+
 	return cfg.Validate()
 }
 
@@ -381,32 +469,34 @@ func (cfg *Manager) ToJSON() ([]byte, error) {
 		return nil
 	}
 
-	for k, v := range cfg.sections {
-		var err error
-		switch k {
-		case Consensus:
-			err = updateJSONConfigs(v, &jcfg.Consensus)
-		case API:
-			err = updateJSONConfigs(v, &jcfg.API)
-		case IPFSConn:
-			err = updateJSONConfigs(v, &jcfg.IPFSConn)
-		case State:
-			err = updateJSONConfigs(v, &jcfg.State)
-		case PinTracker:
-			err = updateJSONConfigs(v, &jcfg.PinTracker)
-		case Monitor:
-			err = updateJSONConfigs(v, &jcfg.Monitor)
-		case Allocator:
-			err = updateJSONConfigs(v, &jcfg.Allocator)
-		case Informer:
-			err = updateJSONConfigs(v, &jcfg.Informer)
-		case Sharder:
-			err = updateJSONConfigs(v, &jcfg.Sharder)
+	for _, t := range SectionTypes() {
+		if t == Cluster {
+			continue
 		}
+		jsection := jcfg.getSection(t)
+		err := updateJSONConfigs(cfg.sections[t], jsection)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return DefaultJSONMarshal(jcfg)
+}
+
+// GetClusterConfig extracts cluster config from the configuration file
+// and returns bytes of it
+func GetClusterConfig(configPath string) ([]byte, error) {
+	file, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		logger.Error("error reading the configuration file: ", err)
+		return nil, err
+	}
+
+	jcfg := &jsonConfig{}
+	err = json.Unmarshal(file, jcfg)
+	if err != nil {
+		logger.Error("error parsing JSON: ", err)
+		return nil, err
+	}
+	return []byte(*jcfg.Cluster), nil
 }

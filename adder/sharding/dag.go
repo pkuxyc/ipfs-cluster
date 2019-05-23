@@ -126,8 +126,8 @@ func makeDAG(ctx context.Context, dagObj map[string]cid.Cid) ([]ipld.Node, error
 func putDAG(ctx context.Context, rpcC *rpc.Client, nodes []ipld.Node, dests []peer.ID) error {
 	for _, n := range nodes {
 		//logger.Debugf("The dag cbor Node Links: %+v", n.Links())
-		b := api.NodeWithMeta{
-			Cid:    n.Cid().String(), // Tests depend on this.
+		b := &api.NodeWithMeta{
+			Cid:    n.Cid(), // Tests depend on this.
 			Data:   n.RawData(),
 			Format: "cbor",
 		}
@@ -140,8 +140,8 @@ func putDAG(ctx context.Context, rpcC *rpc.Client, nodes []ipld.Node, dests []pe
 		errs := rpcC.MultiCall(
 			ctxs,
 			dests,
-			"Cluster",
-			"IPFSBlockPut",
+			"IPFSConnector",
+			"BlockPut",
 			b,
 			rpcutil.RPCDiscardReplies(len(dests)),
 		)

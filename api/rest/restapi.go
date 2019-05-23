@@ -16,7 +16,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,12 +28,17 @@ import (
 	p2phttp "github.com/hsanjuan/go-libp2p-http"
 	cid "github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
+	gopath "github.com/ipfs/go-path"
 	libp2p "github.com/libp2p/go-libp2p"
 	rpc "github.com/libp2p/go-libp2p-gorpc"
 	host "github.com/libp2p/go-libp2p-host"
 	peer "github.com/libp2p/go-libp2p-peer"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr-net"
+	"github.com/rs/cors"
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/plugin/ochttp/propagation/tracecontext"
+	"go.opencensus.io/trace"
 )
 
 func init() {
@@ -96,33 +100,51 @@ type peerAddBody struct {
 }
 
 // NewAPI creates a new REST API component with the given configuration.
-func NewAPI(cfg *Config) (*API, error) {
-	return NewAPIWithHost(cfg, nil)
+func NewAPI(ctx context.Context, cfg *Config) (*API, error) {
+	return NewAPIWithHost(ctx, cfg, nil)
 }
 
 // NewAPIWithHost creates a new REST API component and enables
 // the libp2p-http endpoint using the given Host, if not nil.
-func NewAPIWithHost(cfg *Config, h host.Host) (*API, error) {
+func NewAPIWithHost(ctx context.Context, cfg *Config, h host.Host) (*API, error) {
 	err := cfg.Validate()
 	if err != nil {
 		return nil, err
 	}
 
+	// Our handler is a gorilla router,
+	// wrapped with the cors handler,
+	// wrapped with the basic auth handler.
 	router := mux.NewRouter().StrictSlash(true)
+	handler := basicAuthHandler(
+		cfg.BasicAuthCreds,
+		cors.New(*cfg.corsOptions()).Handler(router),
+	)
+	if cfg.Tracing {
+		handler = &ochttp.Handler{
+			IsPublicEndpoint: true,
+			Propagation:      &tracecontext.HTTPFormat{},
+			Handler:          handler,
+			StartOptions:     trace.StartOptions{SpanKind: trace.SpanKindServer},
+			FormatSpanName:   func(req *http.Request) string { return req.Host + ":" + req.URL.Path + ":" + req.Method },
+		}
+	}
 	s := &http.Server{
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
-		Handler:           router,
+		Handler:           handler,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 
 	// See: https://github.com/ipfs/go-ipfs/issues/5168
 	// See: https://github.com/ipfs/ipfs-cluster/issues/548
 	// on why this is re-enabled.
 	s.SetKeepAlivesEnabled(true)
+	s.MaxHeaderBytes = cfg.MaxHeaderBytes
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 
 	api := &API{
 		ctx:      ctx,
@@ -135,7 +157,7 @@ func NewAPIWithHost(cfg *Config, h host.Host) (*API, error) {
 	api.addRoutes(router)
 
 	// Set up api.httpListener if enabled
-	err = api.setupHTTP()
+	err = api.setupHTTP(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -150,11 +172,11 @@ func NewAPIWithHost(cfg *Config, h host.Host) (*API, error) {
 		return nil, ErrNoEndpointsEnabled
 	}
 
-	api.run()
+	api.run(ctx)
 	return api, nil
 }
 
-func (api *API) setupHTTP() error {
+func (api *API) setupHTTP(ctx context.Context) error {
 	if api.config.HTTPListenAddr == nil {
 		return nil
 	}
@@ -225,20 +247,27 @@ func (api *API) Host() host.Host {
 
 func (api *API) addRoutes(router *mux.Router) {
 	for _, route := range api.routes() {
-		if api.config.BasicAuthCreds != nil {
-			route.HandlerFunc = basicAuth(route.HandlerFunc, api.config.BasicAuthCreds)
-		}
 		router.
 			Methods(route.Method).
 			Path(route.Pattern).
 			Name(route.Name).
-			Handler(route.HandlerFunc)
+			Handler(
+				ochttp.WithRouteTag(
+					http.HandlerFunc(route.HandlerFunc),
+					"/"+route.Name,
+				),
+			)
 	}
 	api.router = router
 }
 
-func basicAuth(h http.HandlerFunc, credentials map[string]string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+// basicAuth wraps a given handler with basic authentication
+func basicAuthHandler(credentials map[string]string, h http.Handler) http.Handler {
+	if credentials == nil {
+		return h
+	}
+
+	wrap := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 		username, password, ok := r.BasicAuth()
 		if !ok {
@@ -268,10 +297,11 @@ func basicAuth(h http.HandlerFunc, credentials map[string]string) http.HandlerFu
 		}
 		h.ServeHTTP(w, r)
 	}
+	return http.HandlerFunc(wrap)
 }
 
 func unauthorizedResp() (string, error) {
-	apiError := types.Error{
+	apiError := &types.Error{
 		Code:    401,
 		Message: "Unauthorized",
 	}
@@ -338,10 +368,22 @@ func (api *API) routes() []route {
 			api.statusAllHandler,
 		},
 		{
+			"Sync",
+			"POST",
+			"/pins/{hash}/sync",
+			api.syncHandler,
+		},
+		{
 			"SyncAll",
 			"POST",
 			"/pins/sync",
 			api.syncAllHandler,
+		},
+		{
+			"Recover",
+			"POST",
+			"/pins/{hash}/recover",
+			api.recoverHandler,
 		},
 		{
 			"RecoverAll",
@@ -362,22 +404,22 @@ func (api *API) routes() []route {
 			api.pinHandler,
 		},
 		{
+			"PinPath",
+			"POST",
+			"/pins/{keyType:ipfs|ipns|ipld}/{path:.*}",
+			api.pinPathHandler,
+		},
+		{
 			"Unpin",
 			"DELETE",
 			"/pins/{hash}",
 			api.unpinHandler,
 		},
 		{
-			"Sync",
-			"POST",
-			"/pins/{hash}/sync",
-			api.syncHandler,
-		},
-		{
-			"Recover",
-			"POST",
-			"/pins/{hash}/recover",
-			api.recoverHandler,
+			"UnpinPath",
+			"DELETE",
+			"/pins/{keyType:ipfs|ipns|ipld}/{path:.*}",
+			api.unpinPathHandler,
 		},
 		{
 			"ConnectionGraph",
@@ -394,20 +436,20 @@ func (api *API) routes() []route {
 	}
 }
 
-func (api *API) run() {
+func (api *API) run(ctx context.Context) {
 	if api.httpListener != nil {
 		api.wg.Add(1)
-		go api.runHTTPServer()
+		go api.runHTTPServer(ctx)
 	}
 
 	if api.libp2pListener != nil {
 		api.wg.Add(1)
-		go api.runLibp2pServer()
+		go api.runLibp2pServer(ctx)
 	}
 }
 
 // runs in goroutine from run()
-func (api *API) runHTTPServer() {
+func (api *API) runHTTPServer(ctx context.Context) {
 	defer api.wg.Done()
 	<-api.rpcReady
 
@@ -419,7 +461,7 @@ func (api *API) runHTTPServer() {
 }
 
 // runs in goroutine from run()
-func (api *API) runLibp2pServer() {
+func (api *API) runLibp2pServer(ctx context.Context) {
 	defer api.wg.Done()
 	<-api.rpcReady
 
@@ -437,7 +479,10 @@ func (api *API) runLibp2pServer() {
 }
 
 // Shutdown stops any API listeners.
-func (api *API) Shutdown() error {
+func (api *API) Shutdown(ctx context.Context) error {
+	_, span := trace.StartSpan(ctx, "restapi/Shutdown")
+	defer span.End()
+
 	api.shutdownLock.Lock()
 	defer api.shutdownLock.Unlock()
 
@@ -481,34 +526,43 @@ func (api *API) SetClient(c *rpc.Client) {
 }
 
 func (api *API) idHandler(w http.ResponseWriter, r *http.Request) {
-	idSerial := types.IDSerial{}
-	err := api.rpcClient.Call("",
+	var id types.ID
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
 		"Cluster",
 		"ID",
 		struct{}{},
-		&idSerial)
+		&id,
+	)
 
-	api.sendResponse(w, autoStatus, err, idSerial)
+	api.sendResponse(w, autoStatus, err, &id)
 }
 
 func (api *API) versionHandler(w http.ResponseWriter, r *http.Request) {
 	var v types.Version
-	err := api.rpcClient.Call("",
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
 		"Cluster",
 		"Version",
 		struct{}{},
-		&v)
+		&v,
+	)
 
 	api.sendResponse(w, autoStatus, err, v)
 }
 
 func (api *API) graphHandler(w http.ResponseWriter, r *http.Request) {
-	var graph types.ConnectGraphSerial
-	err := api.rpcClient.Call("",
+	var graph types.ConnectGraph
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
 		"Cluster",
 		"ConnectGraph",
 		struct{}{},
-		&graph)
+		&graph,
+	)
 	api.sendResponse(w, autoStatus, err, graph)
 }
 
@@ -516,12 +570,15 @@ func (api *API) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
 
-	var metrics []types.Metric
-	err := api.rpcClient.Call("",
-		"Cluster",
-		"PeerMonitorLatestMetrics",
+	var metrics []*types.Metric
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
+		"PeerMonitor",
+		"LatestMetrics",
 		name,
-		&metrics)
+		&metrics,
+	)
 	api.sendResponse(w, autoStatus, err, metrics)
 }
 
@@ -542,7 +599,7 @@ func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
 
 	// any errors sent as trailer
 	adderutils.AddMultipartHTTPHandler(
-		api.ctx,
+		r.Context(),
 		api.rpcClient,
 		params,
 		reader,
@@ -554,14 +611,17 @@ func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) peerListHandler(w http.ResponseWriter, r *http.Request) {
-	var peersSerial []types.IDSerial
-	err := api.rpcClient.Call("",
+	var peers []*types.ID
+	err := api.rpcClient.CallContext(
+		r.Context(),
+		"",
 		"Cluster",
 		"Peers",
 		struct{}{},
-		&peersSerial)
+		&peers,
+	)
 
-	api.sendResponse(w, autoStatus, err, peersSerial)
+	api.sendResponse(w, autoStatus, err, peers)
 }
 
 func (api *API) peerAddHandler(w http.ResponseWriter, r *http.Request) {
@@ -575,56 +635,104 @@ func (api *API) peerAddHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = peer.IDB58Decode(addInfo.PeerID)
+	pid, err := peer.IDB58Decode(addInfo.PeerID)
 	if err != nil {
 		api.sendResponse(w, http.StatusBadRequest, errors.New("error decoding peer_id"), nil)
 		return
 	}
 
-	var ids types.IDSerial
-	err = api.rpcClient.Call("",
+	var id types.ID
+	err = api.rpcClient.CallContext(
+		r.Context(),
+		"",
 		"Cluster",
 		"PeerAdd",
-		addInfo.PeerID,
-		&ids)
-	api.sendResponse(w, autoStatus, err, ids)
+		pid,
+		&id,
+	)
+	api.sendResponse(w, autoStatus, err, &id)
 }
 
 func (api *API) peerRemoveHandler(w http.ResponseWriter, r *http.Request) {
 	if p := api.parsePidOrError(w, r); p != "" {
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"PeerRemove",
 			p,
-			&struct{}{})
+			&struct{}{},
+		)
 		api.sendResponse(w, autoStatus, err, nil)
 	}
 }
 
 func (api *API) pinHandler(w http.ResponseWriter, r *http.Request) {
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
-		logger.Debugf("rest api pinHandler: %s", ps.Cid)
-
-		err := api.rpcClient.Call("",
+	if pin := api.parseCidOrError(w, r); pin != nil {
+		logger.Debugf("rest api pinHandler: %s", pin.Cid)
+		// span.AddAttributes(trace.StringAttribute("cid", pin.Cid))
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"Pin",
-			ps,
-			&struct{}{})
+			pin,
+			&struct{}{},
+		)
 		api.sendResponse(w, http.StatusAccepted, err, nil)
 		logger.Debug("rest api pinHandler done")
 	}
 }
 
 func (api *API) unpinHandler(w http.ResponseWriter, r *http.Request) {
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
-		logger.Debugf("rest api unpinHandler: %s", ps.Cid)
-		err := api.rpcClient.Call("",
+	if pin := api.parseCidOrError(w, r); pin != nil {
+		logger.Debugf("rest api unpinHandler: %s", pin.Cid)
+		// span.AddAttributes(trace.StringAttribute("cid", pin.Cid))
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"Unpin",
-			ps,
-			&struct{}{})
+			pin,
+			&struct{}{},
+		)
 		api.sendResponse(w, http.StatusAccepted, err, nil)
 		logger.Debug("rest api unpinHandler done")
+	}
+}
+
+func (api *API) pinPathHandler(w http.ResponseWriter, r *http.Request) {
+	var pin types.Pin
+	if pinpath := api.parsePinPathOrError(w, r); pinpath != nil {
+		logger.Debugf("rest api pinPathHandler: %s", pinpath.Path)
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
+			"Cluster",
+			"PinPath",
+			pinpath,
+			&pin,
+		)
+
+		api.sendResponse(w, http.StatusOK, err, pin)
+		logger.Debug("rest api pinPathHandler done")
+	}
+}
+
+func (api *API) unpinPathHandler(w http.ResponseWriter, r *http.Request) {
+	var pin types.Pin
+	if pinpath := api.parsePinPathOrError(w, r); pinpath != nil {
+		logger.Debugf("rest api unpinPathHandler: %s", pinpath.Path)
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
+			"Cluster",
+			"UnpinPath",
+			pinpath,
+			&pin,
+		)
+		api.sendResponse(w, http.StatusOK, err, pin)
+		logger.Debug("rest api unpinPathHandler done")
 	}
 }
 
@@ -635,83 +743,149 @@ func (api *API) allocationsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, f := range strings.Split(filterStr, ",") {
 		filter |= types.PinTypeFromString(f)
 	}
-	var pins []types.PinSerial
-	err := api.rpcClient.Call(
+
+	if filter == types.BadType {
+		api.sendResponse(w, http.StatusBadRequest, errors.New("invalid filter value"), nil)
+		return
+	}
+
+	var pins []*types.Pin
+	err := api.rpcClient.CallContext(
+		r.Context(),
 		"",
 		"Cluster",
 		"Pins",
 		struct{}{},
 		&pins,
 	)
-	outPins := make([]types.PinSerial, 0)
-	for _, pinS := range pins {
-		if uint64(filter)&pinS.Type > 0 {
+	outPins := make([]*types.Pin, 0)
+	for _, pin := range pins {
+		if filter&pin.Type > 0 {
 			// add this pin to output
-			outPins = append(outPins, pinS)
+			outPins = append(outPins, pin)
 		}
 	}
 	api.sendResponse(w, autoStatus, err, outPins)
 }
 
 func (api *API) allocationHandler(w http.ResponseWriter, r *http.Request) {
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
-		var pin types.PinSerial
-		err := api.rpcClient.Call("",
+	if pin := api.parseCidOrError(w, r); pin != nil {
+		var pinResp types.Pin
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"PinGet",
-			ps,
-			&pin)
+			pin.Cid,
+			&pinResp,
+		)
 		if err != nil { // errors here are 404s
 			api.sendResponse(w, http.StatusNotFound, err, nil)
 			return
 		}
-		api.sendResponse(w, autoStatus, nil, pin)
+		api.sendResponse(w, autoStatus, nil, pinResp)
 	}
+}
+
+// filterGlobalPinInfos takes a GlobalPinInfo slice and discards
+// any item in it which does not carry a PinInfo matching the
+// filter (OR-wise).
+func filterGlobalPinInfos(globalPinInfos []*types.GlobalPinInfo, filter types.TrackerStatus) []*types.GlobalPinInfo {
+	if filter == types.TrackerStatusUndefined {
+		return globalPinInfos
+	}
+
+	var filteredGlobalPinInfos []*types.GlobalPinInfo
+
+	for _, globalPinInfo := range globalPinInfos {
+		for _, pinInfo := range globalPinInfo.PeerMap {
+			// silenced the error because we should have detected
+			// earlier if filters were invalid
+			if pinInfo.Status.Match(filter) {
+				filteredGlobalPinInfos = append(filteredGlobalPinInfos, globalPinInfo)
+				break
+			}
+		}
+	}
+
+	return filteredGlobalPinInfos
 }
 
 func (api *API) statusAllHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
+	var globalPinInfos []*types.GlobalPinInfo
+
+	filterStr := queryValues.Get("filter")
+	filter := types.TrackerStatusFromString(filterStr)
+	if filter == types.TrackerStatusUndefined && filterStr != "" {
+		api.sendResponse(w, http.StatusBadRequest, errors.New("invalid filter value"), nil)
+		return
+	}
+
 	if local == "true" {
-		var pinInfos []types.PinInfoSerial
-		err := api.rpcClient.Call("",
+		var pinInfos []*types.PinInfo
+
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"StatusAllLocal",
 			struct{}{},
-			&pinInfos)
-		api.sendResponse(w, autoStatus, err, pinInfosToGlobal(pinInfos))
+			&pinInfos,
+		)
+		if err != nil {
+			api.sendResponse(w, autoStatus, err, nil)
+			return
+		}
+		globalPinInfos = pinInfosToGlobal(pinInfos)
 	} else {
-		var pinInfos []types.GlobalPinInfoSerial
-		err := api.rpcClient.Call("",
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"StatusAll",
 			struct{}{},
-			&pinInfos)
-		api.sendResponse(w, autoStatus, err, pinInfos)
+			&globalPinInfos,
+		)
+		if err != nil {
+			api.sendResponse(w, autoStatus, err, nil)
+			return
+		}
 	}
+
+	globalPinInfos = filterGlobalPinInfos(globalPinInfos, filter)
+
+	api.sendResponse(w, autoStatus, nil, globalPinInfos)
 }
 
 func (api *API) statusHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
+	if pin := api.parseCidOrError(w, r); pin != nil {
 		if local == "true" {
-			var pinInfo types.PinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.PinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"StatusLocal",
-				ps,
-				&pinInfo)
-			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(pinInfo))
+				pin.Cid,
+				&pinInfo,
+			)
+			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(&pinInfo))
 		} else {
-			var pinInfo types.GlobalPinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.GlobalPinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"Status",
-				ps,
-				&pinInfo)
+				pin.Cid,
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfo)
 		}
 	}
@@ -722,20 +896,26 @@ func (api *API) syncAllHandler(w http.ResponseWriter, r *http.Request) {
 	local := queryValues.Get("local")
 
 	if local == "true" {
-		var pinInfos []types.PinInfoSerial
-		err := api.rpcClient.Call("",
+		var pinInfos []*types.PinInfo
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"SyncAllLocal",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfosToGlobal(pinInfos))
 	} else {
-		var pinInfos []types.GlobalPinInfoSerial
-		err := api.rpcClient.Call("",
+		var pinInfos []*types.GlobalPinInfo
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"SyncAll",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfos)
 	}
 }
@@ -744,22 +924,28 @@ func (api *API) syncHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
+	if pin := api.parseCidOrError(w, r); pin != nil {
 		if local == "true" {
-			var pinInfo types.PinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.PinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"SyncLocal",
-				ps,
-				&pinInfo)
-			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(pinInfo))
+				pin.Cid,
+				&pinInfo,
+			)
+			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(&pinInfo))
 		} else {
-			var pinInfo types.GlobalPinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.GlobalPinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"Sync",
-				ps,
-				&pinInfo)
+				pin.Cid,
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfo)
 		}
 	}
@@ -769,12 +955,15 @@ func (api *API) recoverAllHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 	if local == "true" {
-		var pinInfos []types.PinInfoSerial
-		err := api.rpcClient.Call("",
+		var pinInfos []*types.PinInfo
+		err := api.rpcClient.CallContext(
+			r.Context(),
+			"",
 			"Cluster",
 			"RecoverAllLocal",
 			struct{}{},
-			&pinInfos)
+			&pinInfos,
+		)
 		api.sendResponse(w, autoStatus, err, pinInfosToGlobal(pinInfos))
 	} else {
 		api.sendResponse(w, http.StatusBadRequest, errors.New("only requests with parameter local=true are supported"), nil)
@@ -785,69 +974,62 @@ func (api *API) recoverHandler(w http.ResponseWriter, r *http.Request) {
 	queryValues := r.URL.Query()
 	local := queryValues.Get("local")
 
-	if ps := api.parseCidOrError(w, r); ps.Cid != "" {
+	if pin := api.parseCidOrError(w, r); pin != nil {
 		if local == "true" {
-			var pinInfo types.PinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.PinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"RecoverLocal",
-				ps,
-				&pinInfo)
-			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(pinInfo))
+				pin.Cid,
+				&pinInfo,
+			)
+			api.sendResponse(w, autoStatus, err, pinInfoToGlobal(&pinInfo))
 		} else {
-			var pinInfo types.GlobalPinInfoSerial
-			err := api.rpcClient.Call("",
+			var pinInfo types.GlobalPinInfo
+			err := api.rpcClient.CallContext(
+				r.Context(),
+				"",
 				"Cluster",
 				"Recover",
-				ps,
-				&pinInfo)
+				pin.Cid,
+				&pinInfo,
+			)
 			api.sendResponse(w, autoStatus, err, pinInfo)
 		}
 	}
 }
 
-func (api *API) parseCidOrError(w http.ResponseWriter, r *http.Request) types.PinSerial {
+func (api *API) parsePinPathOrError(w http.ResponseWriter, r *http.Request) *types.PinPath {
+	vars := mux.Vars(r)
+	urlpath := "/" + vars["keyType"] + "/" + strings.TrimSuffix(vars["path"], "/")
+
+	path, err := gopath.ParsePath(urlpath)
+	if err != nil {
+		api.sendResponse(w, http.StatusBadRequest, errors.New("error parsing path: "+err.Error()), nil)
+		return nil
+	}
+
+	pinPath := &types.PinPath{Path: path.String()}
+	pinPath.PinOptions.FromQuery(r.URL.Query())
+	return pinPath
+}
+
+func (api *API) parseCidOrError(w http.ResponseWriter, r *http.Request) *types.Pin {
 	vars := mux.Vars(r)
 	hash := vars["hash"]
 
-	_, err := cid.Decode(hash)
+	c, err := cid.Decode(hash)
 	if err != nil {
 		api.sendResponse(w, http.StatusBadRequest, errors.New("error decoding Cid: "+err.Error()), nil)
-		return types.PinSerial{Cid: ""}
+		return nil
 	}
 
-	pin := types.PinSerial{
-		Cid:  hash,
-		Type: uint64(types.DataType),
-	}
-
-	queryValues := r.URL.Query()
-	name := queryValues.Get("name")
-	pin.Name = name
+	opts := types.PinOptions{}
+	opts.FromQuery(r.URL.Query())
+	pin := types.PinWithOpts(c, opts)
 	pin.MaxDepth = -1 // For now, all pins are recursive
-	rplStr := queryValues.Get("replication")
-	if rplStr == "" { // compat <= 0.4.0
-		rplStr = queryValues.Get("replication_factor")
-	}
-	rplStrMin := queryValues.Get("replication-min")
-	if rplStrMin == "" { // compat <= 0.4.0
-		rplStrMin = queryValues.Get("replication_factor_min")
-	}
-	rplStrMax := queryValues.Get("replication-max")
-	if rplStrMax == "" { // compat <= 0.4.0
-		rplStrMax = queryValues.Get("replication_factor_max")
-	}
-	if rplStr != "" { // override
-		rplStrMin = rplStr
-		rplStrMax = rplStr
-	}
-	if rpl, err := strconv.Atoi(rplStrMin); err == nil {
-		pin.ReplicationFactorMin = rpl
-	}
-	if rpl, err := strconv.Atoi(rplStrMax); err == nil {
-		pin.ReplicationFactorMax = rpl
-	}
-
 	return pin
 }
 
@@ -862,17 +1044,17 @@ func (api *API) parsePidOrError(w http.ResponseWriter, r *http.Request) peer.ID 
 	return pid
 }
 
-func pinInfoToGlobal(pInfo types.PinInfoSerial) types.GlobalPinInfoSerial {
-	return types.GlobalPinInfoSerial{
+func pinInfoToGlobal(pInfo *types.PinInfo) *types.GlobalPinInfo {
+	return &types.GlobalPinInfo{
 		Cid: pInfo.Cid,
-		PeerMap: map[string]types.PinInfoSerial{
-			pInfo.Peer: pInfo,
+		PeerMap: map[string]*types.PinInfo{
+			peer.IDB58Encode(pInfo.Peer): pInfo,
 		},
 	}
 }
 
-func pinInfosToGlobal(pInfos []types.PinInfoSerial) []types.GlobalPinInfoSerial {
-	gPInfos := make([]types.GlobalPinInfoSerial, len(pInfos), len(pInfos))
+func pinInfosToGlobal(pInfos []*types.PinInfo) []*types.GlobalPinInfo {
+	gPInfos := make([]*types.GlobalPinInfo, len(pInfos), len(pInfos))
 	for i, p := range pInfos {
 		gPInfos[i] = pinInfoToGlobal(p)
 	}

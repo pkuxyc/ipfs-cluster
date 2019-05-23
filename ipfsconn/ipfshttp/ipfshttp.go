@@ -3,32 +3,33 @@
 package ipfshttp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ipfs/ipfs-cluster/adder/adderutils"
+	gopath "github.com/ipfs/go-path"
+
 	"github.com/ipfs/ipfs-cluster/api"
-	"github.com/ipfs/ipfs-cluster/rpcutil"
+	"github.com/ipfs/ipfs-cluster/observations"
+
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/plugin/ochttp/propagation/tracecontext"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/trace"
 
 	cid "github.com/ipfs/go-cid"
 	files "github.com/ipfs/go-ipfs-files"
 	logging "github.com/ipfs/go-log"
 	rpc "github.com/libp2p/go-libp2p-gorpc"
 	peer "github.com/libp2p/go-libp2p-peer"
-	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
 	manet "github.com/multiformats/go-multiaddr-net"
 )
@@ -44,14 +45,9 @@ var logger = logging.Logger("ipfshttp")
 var updateMetricMod = 10
 
 // Connector implements the IPFSConnector interface
-// and provides a component which does two tasks:
-//
-// On one side, it proxies HTTP requests to the configured IPFS
-// daemon. It is able to intercept these requests though, and
-// perform extra operations on them.
-//
-// On the other side, it is used to perform on-demand requests
-// against the configured IPFS daemom (such as a pin request).
+// and provides a component which  is used to perform
+// on-demand requests against the configured IPFS daemom
+// (such as a pin request).
 type Connector struct {
 	ctx    context.Context
 	cancel func()
@@ -59,14 +55,10 @@ type Connector struct {
 	config   *Config
 	nodeAddr string
 
-	handlers map[string]func(http.ResponseWriter, *http.Request)
-
 	rpcClient *rpc.Client
 	rpcReady  chan struct{}
 
-	listener net.Listener // proxy listener
-	server   *http.Server // proxy server
-	client   *http.Client // client to ipfs daemon
+	client *http.Client // client to ipfs daemon
 
 	updateMetricMutex sync.Mutex
 	updateMetricCount int
@@ -88,21 +80,13 @@ type ipfsPinLsResp struct {
 	Keys map[string]ipfsPinType
 }
 
-type ipfsPinOpResp struct {
-	Pins []string
-}
-
 type ipfsIDResp struct {
 	ID        string
 	Addresses []string
 }
 
-// From https://github.com/ipfs/go-ipfs/blob/master/core/coreunix/add.go#L49
-type ipfsAddResp struct {
-	Name  string
-	Hash  string `json:",omitempty"`
-	Bytes int64  `json:",omitempty"`
-	Size  string `json:",omitempty"`
+type ipfsResolveResp struct {
+	Path string
 }
 
 type ipfsSwarmPeersResp struct {
@@ -142,39 +126,16 @@ func NewConnector(cfg *Config) (*Connector, error) {
 		return nil, err
 	}
 
-	proxyNet, proxyAddr, err := manet.DialArgs(cfg.ProxyAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	l, err := net.Listen(proxyNet, proxyAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	nodeHTTPAddr := "http://" + nodeAddr
-	proxyURL, err := url.Parse(nodeHTTPAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	proxyHandler := httputil.NewSingleHostReverseProxy(proxyURL)
-
-	smux := http.NewServeMux()
-	s := &http.Server{
-		ReadTimeout:       cfg.ProxyReadTimeout,
-		WriteTimeout:      cfg.ProxyWriteTimeout,
-		ReadHeaderTimeout: cfg.ProxyReadHeaderTimeout,
-		IdleTimeout:       cfg.ProxyIdleTimeout,
-		Handler:           smux,
-	}
-
-	// See: https://github.com/ipfs/go-ipfs/issues/5168
-	// See: https://github.com/ipfs/ipfs-cluster/issues/548
-	// on why this is re-enabled.
-	s.SetKeepAlivesEnabled(false) // A reminder that this can be changed
-
 	c := &http.Client{} // timeouts are handled by context timeouts
+	if cfg.Tracing {
+		c.Transport = &ochttp.Transport{
+			Base:           http.DefaultTransport,
+			Propagation:    &tracecontext.HTTPFormat{},
+			StartOptions:   trace.StartOptions{SpanKind: trace.SpanKindClient},
+			FormatSpanName: func(req *http.Request) string { return req.Host + ":" + req.URL.Path + ":" + req.Method },
+			NewClientTrace: ochttp.NewSpanAnnotatingClientTrace,
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -183,28 +144,15 @@ func NewConnector(cfg *Config) (*Connector, error) {
 		config:   cfg,
 		cancel:   cancel,
 		nodeAddr: nodeAddr,
-		handlers: make(map[string]func(http.ResponseWriter, *http.Request)),
 		rpcReady: make(chan struct{}, 1),
-		listener: l,
-		server:   s,
 		client:   c,
 	}
-
-	smux.Handle("/", proxyHandler)
-	smux.HandleFunc("/api/v0/pin/add", ipfs.pinHandler)   // add?arg=xxx
-	smux.HandleFunc("/api/v0/pin/add/", ipfs.pinHandler)  // add/xxx
-	smux.HandleFunc("/api/v0/pin/rm", ipfs.unpinHandler)  // rm?arg=xxx
-	smux.HandleFunc("/api/v0/pin/rm/", ipfs.unpinHandler) // rm/xxx
-	smux.HandleFunc("/api/v0/pin/ls", ipfs.pinLsHandler)  // required to handle /pin/ls for all pins
-	smux.HandleFunc("/api/v0/pin/ls/", ipfs.pinLsHandler) // ls/xxx
-	smux.HandleFunc("/api/v0/add", ipfs.addHandler)
-	smux.HandleFunc("/api/v0/repo/stat", ipfs.repoStatHandler)
 
 	go ipfs.run()
 	return ipfs, nil
 }
 
-// launches proxy and connects all ipfs daemons when
+// connects all ipfs daemons when
 // we receive the rpcReady signal.
 func (ipfs *Connector) run() {
 	<-ipfs.rpcReady
@@ -213,21 +161,6 @@ func (ipfs *Connector) run() {
 	// -- prevents race conditions with ipfs.wg.
 	ipfs.shutdownLock.Lock()
 	defer ipfs.shutdownLock.Unlock()
-
-	// This launches the proxy
-	ipfs.wg.Add(1)
-	go func() {
-		defer ipfs.wg.Done()
-		logger.Infof(
-			"IPFS Proxy: %s -> %s",
-			ipfs.config.ProxyAddr,
-			ipfs.config.NodeAddr,
-		)
-		err := ipfs.server.Serve(ipfs.listener) // hangs here
-		if err != nil && !strings.Contains(err.Error(), "closed network connection") {
-			logger.Error(err)
-		}
-	}()
 
 	// This runs ipfs swarm connect to the daemons of other cluster members
 	ipfs.wg.Add(1)
@@ -243,239 +176,11 @@ func (ipfs *Connector) run() {
 		case <-tmr.C:
 			// do not hang this goroutine if this call hangs
 			// otherwise we hang during shutdown
-			go ipfs.ConnectSwarms()
+			go ipfs.ConnectSwarms(ipfs.ctx)
 		case <-ipfs.ctx.Done():
 			return
 		}
 	}()
-}
-
-func ipfsErrorResponder(w http.ResponseWriter, errMsg string) {
-	res := ipfsError{errMsg}
-	resBytes, _ := json.Marshal(res)
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	w.Write(resBytes)
-	return
-}
-
-func (ipfs *Connector) pinOpHandler(op string, w http.ResponseWriter, r *http.Request) {
-	arg, ok := extractArgument(r.URL)
-	if !ok {
-		ipfsErrorResponder(w, "Error: bad argument")
-		return
-	}
-	c, err := cid.Decode(arg)
-	if err != nil {
-		ipfsErrorResponder(w, "Error parsing CID: "+err.Error())
-		return
-	}
-
-	err = ipfs.rpcClient.Call(
-		"",
-		"Cluster",
-		op,
-		api.PinCid(c).ToSerial(),
-		&struct{}{},
-	)
-	if err != nil {
-		ipfsErrorResponder(w, err.Error())
-		return
-	}
-
-	res := ipfsPinOpResp{
-		Pins: []string{arg},
-	}
-	resBytes, _ := json.Marshal(res)
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(resBytes)
-	return
-}
-
-func (ipfs *Connector) pinHandler(w http.ResponseWriter, r *http.Request) {
-	ipfs.pinOpHandler("Pin", w, r)
-}
-
-func (ipfs *Connector) unpinHandler(w http.ResponseWriter, r *http.Request) {
-	ipfs.pinOpHandler("Unpin", w, r)
-}
-
-func (ipfs *Connector) pinLsHandler(w http.ResponseWriter, r *http.Request) {
-	pinLs := ipfsPinLsResp{}
-	pinLs.Keys = make(map[string]ipfsPinType)
-
-	arg, ok := extractArgument(r.URL)
-	if ok {
-		c, err := cid.Decode(arg)
-		if err != nil {
-			ipfsErrorResponder(w, err.Error())
-			return
-		}
-		var pin api.PinSerial
-		err = ipfs.rpcClient.Call(
-			"",
-			"Cluster",
-			"PinGet",
-			api.PinCid(c).ToSerial(),
-			&pin,
-		)
-		if err != nil {
-			ipfsErrorResponder(w, fmt.Sprintf("Error: path '%s' is not pinned", arg))
-			return
-		}
-		pinLs.Keys[pin.Cid] = ipfsPinType{
-			Type: "recursive",
-		}
-	} else {
-		pins := make([]api.PinSerial, 0)
-		err := ipfs.rpcClient.Call(
-			"",
-			"Cluster",
-			"Pins",
-			struct{}{},
-			&pins,
-		)
-		if err != nil {
-			ipfsErrorResponder(w, err.Error())
-			return
-		}
-
-		for _, pin := range pins {
-			pinLs.Keys[pin.Cid] = ipfsPinType{
-				Type: "recursive",
-			}
-		}
-	}
-
-	resBytes, _ := json.Marshal(pinLs)
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(resBytes)
-}
-
-func (ipfs *Connector) addHandler(w http.ResponseWriter, r *http.Request) {
-	reader, err := r.MultipartReader()
-	if err != nil {
-		ipfsErrorResponder(w, "error reading request: "+err.Error())
-		return
-	}
-
-	q := r.URL.Query()
-	if q.Get("only-hash") == "true" {
-		ipfsErrorResponder(w, "only-hash is not supported when adding to cluster")
-	}
-
-	unpin := q.Get("pin") == "false"
-
-	// Luckily, most IPFS add query params are compatible with cluster's
-	// /add params. We can parse most of them directly from the query.
-	params, err := api.AddParamsFromQuery(q)
-	if err != nil {
-		ipfsErrorResponder(w, "error parsing options:"+err.Error())
-		return
-	}
-	trickle := q.Get("trickle")
-	if trickle == "true" {
-		params.Layout = "trickle"
-	}
-
-	logger.Warningf("Proxy/add does not support all IPFS params. Current options: %+v", params)
-
-	outputTransform := func(in *api.AddedOutput) interface{} {
-		r := &ipfsAddResp{
-			Name:  in.Name,
-			Hash:  in.Cid,
-			Bytes: int64(in.Bytes),
-		}
-		if in.Size != 0 {
-			r.Size = strconv.FormatUint(in.Size, 10)
-		}
-		return r
-	}
-
-	root, err := adderutils.AddMultipartHTTPHandler(
-		ipfs.ctx,
-		ipfs.rpcClient,
-		params,
-		reader,
-		w,
-		outputTransform,
-	)
-
-	// any errors have been sent as Trailer
-	if err != nil {
-		return
-	}
-
-	if !unpin {
-		return
-	}
-
-	// Unpin because the user doesn't want to pin
-	time.Sleep(100 * time.Millisecond)
-	err = ipfs.rpcClient.CallContext(
-		ipfs.ctx,
-		"",
-		"Cluster",
-		"Unpin",
-		api.PinCid(root).ToSerial(),
-		&struct{}{},
-	)
-	if err != nil {
-		w.Header().Set("X-Stream-Error", err.Error())
-		return
-	}
-}
-
-func (ipfs *Connector) repoStatHandler(w http.ResponseWriter, r *http.Request) {
-	peers := make([]peer.ID, 0)
-	err := ipfs.rpcClient.Call(
-		"",
-		"Cluster",
-		"ConsensusPeers",
-		struct{}{},
-		&peers,
-	)
-	if err != nil {
-		ipfsErrorResponder(w, err.Error())
-		return
-	}
-
-	ctxs, cancels := rpcutil.CtxsWithTimeout(ipfs.ctx, len(peers), ipfs.config.IPFSRequestTimeout)
-	defer rpcutil.MultiCancel(cancels)
-
-	repoStats := make([]api.IPFSRepoStat, len(peers), len(peers))
-	repoStatsIfaces := make([]interface{}, len(repoStats), len(repoStats))
-	for i := range repoStats {
-		repoStatsIfaces[i] = &repoStats[i]
-	}
-
-	errs := ipfs.rpcClient.MultiCall(
-		ctxs,
-		peers,
-		"Cluster",
-		"IPFSRepoStat",
-		struct{}{},
-		repoStatsIfaces,
-	)
-
-	totalStats := api.IPFSRepoStat{}
-
-	for i, err := range errs {
-		if err != nil {
-			logger.Errorf("%s repo/stat errored: %s", peers[i], err)
-			continue
-		}
-		totalStats.RepoSize += repoStats[i].RepoSize
-		totalStats.StorageMax += repoStats[i].StorageMax
-	}
-
-	resBytes, _ := json.Marshal(totalStats)
-	w.Header().Add("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(resBytes)
-	return
 }
 
 // SetClient makes the component ready to perform RPC
@@ -487,7 +192,10 @@ func (ipfs *Connector) SetClient(c *rpc.Client) {
 
 // Shutdown stops any listeners and stops the component from taking
 // any requests.
-func (ipfs *Connector) Shutdown() error {
+func (ipfs *Connector) Shutdown(ctx context.Context) error {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/Shutdown")
+	defer span.End()
+
 	ipfs.shutdownLock.Lock()
 	defer ipfs.shutdownLock.Unlock()
 
@@ -496,50 +204,51 @@ func (ipfs *Connector) Shutdown() error {
 		return nil
 	}
 
-	logger.Info("stopping IPFS Proxy")
+	logger.Info("stopping IPFS Connector")
 
 	ipfs.cancel()
 	close(ipfs.rpcReady)
-	ipfs.server.SetKeepAlivesEnabled(false)
-	ipfs.listener.Close()
 
 	ipfs.wg.Wait()
 	ipfs.shutdown = true
+
 	return nil
 }
 
 // ID performs an ID request against the configured
 // IPFS daemon. It returns the fetched information.
 // If the request fails, or the parsing fails, it
-// returns an error and an empty IPFSID which also
-// contains the error message.
-func (ipfs *Connector) ID() (api.IPFSID, error) {
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
+// returns an error.
+func (ipfs *Connector) ID(ctx context.Context) (*api.IPFSID, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/ID")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
-	id := api.IPFSID{}
+
 	body, err := ipfs.postCtx(ctx, "id", "", nil)
 	if err != nil {
-		id.Error = err.Error()
-		return id, err
+		return nil, err
 	}
 
 	var res ipfsIDResp
 	err = json.Unmarshal(body, &res)
 	if err != nil {
-		id.Error = err.Error()
-		return id, err
+		return nil, err
 	}
 
 	pID, err := peer.IDB58Decode(res.ID)
 	if err != nil {
-		id.Error = err.Error()
-		return id, err
+		return nil, err
 	}
-	id.ID = pID
 
-	mAddrs := make([]ma.Multiaddr, len(res.Addresses), len(res.Addresses))
+	id := &api.IPFSID{
+		ID: pID,
+	}
+
+	mAddrs := make([]api.Multiaddr, len(res.Addresses), len(res.Addresses))
 	for i, strAddr := range res.Addresses {
-		mAddr, err := ma.NewMultiaddr(strAddr)
+		mAddr, err := api.NewMultiaddr(strAddr)
 		if err != nil {
 			id.Error = err.Error()
 			return id, err
@@ -553,6 +262,9 @@ func (ipfs *Connector) ID() (api.IPFSID, error) {
 // Pin performs a pin request against the configured IPFS
 // daemon.
 func (ipfs *Connector) Pin(ctx context.Context, hash cid.Cid, maxDepth int) error {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/Pin")
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, ipfs.config.PinTimeout)
 	defer cancel()
 	pinStatus, err := ipfs.PinLsCid(ctx, hash)
@@ -565,7 +277,7 @@ func (ipfs *Connector) Pin(ctx context.Context, hash cid.Cid, maxDepth int) erro
 		return nil
 	}
 
-	defer ipfs.updateInformerMetric()
+	defer ipfs.updateInformerMetric(ctx)
 
 	var pinArgs string
 	switch {
@@ -585,6 +297,7 @@ func (ipfs *Connector) Pin(ctx context.Context, hash cid.Cid, maxDepth int) erro
 			return err
 		}
 		logger.Debugf("Refs for %s sucessfully fetched", hash)
+		stats.Record(ctx, observations.Pins.M(1))
 	}
 
 	path := fmt.Sprintf("pin/add?arg=%s&%s", hash, pinArgs)
@@ -598,6 +311,9 @@ func (ipfs *Connector) Pin(ctx context.Context, hash cid.Cid, maxDepth int) erro
 // Unpin performs an unpin request against the configured IPFS
 // daemon.
 func (ipfs *Connector) Unpin(ctx context.Context, hash cid.Cid) error {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/Unpin")
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, ipfs.config.UnpinTimeout)
 	defer cancel()
 
@@ -606,13 +322,14 @@ func (ipfs *Connector) Unpin(ctx context.Context, hash cid.Cid) error {
 		return err
 	}
 	if pinStatus.IsPinned(-1) {
-		defer ipfs.updateInformerMetric()
+		defer ipfs.updateInformerMetric(ctx)
 		path := fmt.Sprintf("pin/rm?arg=%s", hash)
 		_, err := ipfs.postCtx(ctx, path, "", nil)
-		if err == nil {
-			logger.Info("IPFS Unpin request succeeded:", hash)
+		if err != nil {
+			return err
 		}
-		return err
+		logger.Info("IPFS Unpin request succeeded:", hash)
+		stats.Record(ctx, observations.Pins.M(-1))
 	}
 
 	logger.Debug("IPFS object is already unpinned: ", hash)
@@ -622,6 +339,9 @@ func (ipfs *Connector) Unpin(ctx context.Context, hash cid.Cid) error {
 // PinLs performs a "pin ls --type typeFilter" request against the configured
 // IPFS daemon and returns a map of cid strings and their status.
 func (ipfs *Connector) PinLs(ctx context.Context, typeFilter string) (map[string]api.IPFSPinStatus, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/PinLs")
+	defer span.End()
+
 	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
 	body, err := ipfs.postCtx(ctx, "pin/ls?type="+typeFilter, "", nil)
@@ -650,6 +370,9 @@ func (ipfs *Connector) PinLs(ctx context.Context, typeFilter string) (map[string
 // "type=recursive" and then, if not found, with "type=direct". It returns an
 // api.IPFSPinStatus for that hash.
 func (ipfs *Connector) PinLsCid(ctx context.Context, hash cid.Cid) (api.IPFSPinStatus, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/PinLsCid")
+	defer span.End()
+
 	pinLsType := func(pinType string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 		defer cancel()
@@ -767,32 +490,38 @@ func (ipfs *Connector) apiURL() string {
 
 // ConnectSwarms requests the ipfs addresses of other peers and
 // triggers ipfs swarm connect requests
-func (ipfs *Connector) ConnectSwarms() error {
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
+func (ipfs *Connector) ConnectSwarms(ctx context.Context) error {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/ConnectSwarms")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
-	idsSerial := make([]api.IDSerial, 0)
-	err := ipfs.rpcClient.Call(
+	var ids []*api.ID
+	err := ipfs.rpcClient.CallContext(
+		ctx,
 		"",
 		"Cluster",
 		"Peers",
 		struct{}{},
-		&idsSerial,
+		&ids,
 	)
 	if err != nil {
 		logger.Error(err)
 		return err
 	}
-	logger.Debugf("%+v", idsSerial)
 
-	for _, idSerial := range idsSerial {
-		ipfsID := idSerial.IPFS
+	for _, id := range ids {
+		ipfsID := id.IPFS
+		if ipfsID == nil || id.Error != "" || ipfsID.Error != "" {
+			continue
+		}
 		for _, addr := range ipfsID.Addresses {
 			// This is a best effort attempt
 			// We ignore errors which happens
 			// when passing in a bunch of addresses
 			_, err := ipfs.postCtx(
 				ctx,
-				fmt.Sprintf("swarm/connect?arg=%s", addr),
+				fmt.Sprintf("swarm/connect?arg=%s", addr.String()),
 				"",
 				nil,
 			)
@@ -854,42 +583,82 @@ func getConfigValue(path []string, cfg map[string]interface{}) (interface{}, err
 
 // RepoStat returns the DiskUsage and StorageMax repo/stat values from the
 // ipfs daemon, in bytes, wrapped as an IPFSRepoStat object.
-func (ipfs *Connector) RepoStat() (api.IPFSRepoStat, error) {
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
+func (ipfs *Connector) RepoStat(ctx context.Context) (*api.IPFSRepoStat, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/RepoStat")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
 	res, err := ipfs.postCtx(ctx, "repo/stat?size-only=true", "", nil)
 	if err != nil {
 		logger.Error(err)
-		return api.IPFSRepoStat{}, err
+		return nil, err
 	}
 
 	var stats api.IPFSRepoStat
 	err = json.Unmarshal(res, &stats)
 	if err != nil {
 		logger.Error(err)
-		return stats, err
+		return nil, err
 	}
-	return stats, nil
+	return &stats, nil
+}
+
+// Resolve accepts ipfs or ipns path and resolves it into a cid
+func (ipfs *Connector) Resolve(ctx context.Context, path string) (cid.Cid, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/Resolve")
+	defer span.End()
+
+	validPath, err := gopath.ParsePath(path)
+	if err != nil {
+		logger.Error("could not parse path: " + err.Error())
+		return cid.Undef, err
+	}
+	if !strings.HasPrefix(path, "/ipns") && validPath.IsJustAKey() {
+		ci, _, err := gopath.SplitAbsPath(validPath)
+		return ci, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
+	defer cancel()
+	res, err := ipfs.postCtx(ctx, "resolve?arg="+url.QueryEscape(path), "", nil)
+	if err != nil {
+		logger.Error(err)
+		return cid.Undef, err
+	}
+
+	var resp ipfsResolveResp
+	err = json.Unmarshal(res, &resp)
+	if err != nil {
+		logger.Error("could not unmarshal response: " + err.Error())
+		return cid.Undef, err
+	}
+
+	ci, _, err := gopath.SplitAbsPath(gopath.FromString(resp.Path))
+	return ci, err
 }
 
 // SwarmPeers returns the peers currently connected to this ipfs daemon.
-func (ipfs *Connector) SwarmPeers() (api.SwarmPeers, error) {
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
+func (ipfs *Connector) SwarmPeers(ctx context.Context) ([]peer.ID, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/SwarmPeers")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
-	swarm := api.SwarmPeers{}
+
 	res, err := ipfs.postCtx(ctx, "swarm/peers", "", nil)
 	if err != nil {
 		logger.Error(err)
-		return swarm, err
+		return nil, err
 	}
 	var peersRaw ipfsSwarmPeersResp
 	err = json.Unmarshal(res, &peersRaw)
 	if err != nil {
 		logger.Error(err)
-		return swarm, err
+		return nil, err
 	}
 
-	swarm = make([]peer.ID, len(peersRaw.Peers))
+	swarm := make([]peer.ID, len(peersRaw.Peers))
 	for i, p := range peersRaw.Peers {
 		pID, err := peer.IDB58Decode(p.Peer)
 		if err != nil {
@@ -903,16 +672,22 @@ func (ipfs *Connector) SwarmPeers() (api.SwarmPeers, error) {
 
 // BlockPut triggers an ipfs block put on the given data, inserting the block
 // into the ipfs daemon's repo.
-func (ipfs *Connector) BlockPut(b api.NodeWithMeta) error {
-	logger.Debugf("putting block to IPFS: %s", b.Cid)
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
-	defer cancel()
-	defer ipfs.updateInformerMetric()
+func (ipfs *Connector) BlockPut(ctx context.Context, b *api.NodeWithMeta) error {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/BlockPut")
+	defer span.End()
 
-	r := ioutil.NopCloser(bytes.NewReader(b.Data))
-	rFile := files.NewReaderFile("", "", r, nil)
-	sliceFile := files.NewSliceFile("", "", []files.File{rFile}) // IPFS reqs require a wrapping directory
-	multiFileR := files.NewMultiFileReader(sliceFile, true)
+	logger.Debugf("putting block to IPFS: %s", b.Cid)
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
+	defer cancel()
+	defer ipfs.updateInformerMetric(ctx)
+
+	mapDir := files.NewMapDirectory(
+		map[string]files.Node{ // IPFS reqs require a wrapping directory
+			"": files.NewBytesFile(b.Data),
+		},
+	)
+
+	multiFileR := files.NewMultiFileReader(mapDir, true)
 	if b.Format == "" {
 		b.Format = "v0"
 	}
@@ -924,33 +699,36 @@ func (ipfs *Connector) BlockPut(b api.NodeWithMeta) error {
 }
 
 // BlockGet retrieves an ipfs block with the given cid
-func (ipfs *Connector) BlockGet(c cid.Cid) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.IPFSRequestTimeout)
+func (ipfs *Connector) BlockGet(ctx context.Context, c cid.Cid) ([]byte, error) {
+	ctx, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/BlockGet")
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, ipfs.config.IPFSRequestTimeout)
 	defer cancel()
 	url := "block/get?arg=" + c.String()
 	return ipfs.postCtx(ctx, url, "", nil)
 }
 
-// extractArgument extracts the cid argument from a url.URL, either via
-// the query string parameters or from the url path itself.
-func extractArgument(u *url.URL) (string, bool) {
-	arg := u.Query().Get("arg")
-	if arg != "" {
-		return arg, true
-	}
+// // FetchRefs asks IPFS to download blocks recursively to the given depth.
+// // It discards the response, but waits until it completes.
+// func (ipfs *Connector) FetchRefs(ctx context.Context, c cid.Cid, maxDepth int) error {
+// 	ctx, cancel := context.WithTimeout(ipfs.ctx, ipfs.config.PinTimeout)
+// 	defer cancel()
 
-	p := strings.TrimPrefix(u.Path, "/api/v0/")
-	segs := strings.Split(p, "/")
+// 	q := url.Values{}
+// 	q.Set("recursive", "true")
+// 	q.Set("unique", "false") // same memory on IPFS side
+// 	q.Set("max-depth", fmt.Sprintf("%d", maxDepth))
+// 	q.Set("arg", c.String())
 
-	if len(segs) > 2 {
-		warnMsg := "You are using an undocumented form of the IPFS API."
-		warnMsg += "Consider passing your command arguments"
-		warnMsg += "with the '?arg=' query parameter"
-		logger.Warning(warnMsg)
-		return segs[len(segs)-1], true
-	}
-	return "", false
-}
+// 	url := fmt.Sprintf("refs?%s", q.Encode())
+// 	err := ipfs.postDiscardBodyCtx(ctx, url)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	logger.Debugf("refs for %s sucessfully fetched", c)
+// 	return nil
+// }
 
 // Returns true every updateMetricsMod-th time that we
 // call this function.
@@ -966,7 +744,11 @@ func (ipfs *Connector) shouldUpdateMetric() bool {
 }
 
 // Trigger a broadcast of the local informer metrics.
-func (ipfs *Connector) updateInformerMetric() error {
+func (ipfs *Connector) updateInformerMetric(ctx context.Context) error {
+	_, span := trace.StartSpan(ctx, "ipfsconn/ipfshttp/updateInformerMetric")
+	defer span.End()
+	ctx = trace.NewContext(ipfs.ctx, span)
+
 	if !ipfs.shouldUpdateMetric() {
 		return nil
 	}
@@ -974,7 +756,7 @@ func (ipfs *Connector) updateInformerMetric() error {
 	var metric api.Metric
 
 	err := ipfs.rpcClient.GoContext(
-		ipfs.ctx,
+		ctx,
 		"",
 		"Cluster",
 		"SendInformerMetric",

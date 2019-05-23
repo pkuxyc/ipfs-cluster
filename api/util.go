@@ -20,13 +20,14 @@ func PeersToStrings(peers []peer.ID) []string {
 
 // StringsToPeers decodes peer.IDs from strings.
 func StringsToPeers(strs []string) []peer.ID {
-	peers := make([]peer.ID, len(strs))
-	for i, p := range strs {
-		var err error
-		peers[i], err = peer.IDB58Decode(p)
+	peers := []peer.ID{}
+	for _, p := range strs {
+		pid, err := peer.IDB58Decode(p)
 		if err != nil {
 			logger.Debugf("'%s': %s", p, err)
+			continue
 		}
+		peers = append(peers, pid)
 	}
 	return peers
 }
@@ -57,11 +58,12 @@ func Libp2pMultiaddrSplit(addr ma.Multiaddr) (peer.ID, ma.Multiaddr, error) {
 // MustLibp2pMultiaddrJoin takes a LibP2P multiaddress and a peer ID and
 // encapsulates a new /ipfs/<peerID> address. It will panic if the given
 // peer ID is bad.
-func MustLibp2pMultiaddrJoin(addr ma.Multiaddr, p peer.ID) ma.Multiaddr {
+func MustLibp2pMultiaddrJoin(addr Multiaddr, p peer.ID) Multiaddr {
+	v := addr.Value()
 	pidAddr, err := ma.NewMultiaddr("/ipfs/" + peer.IDB58Encode(p))
 	// let this break badly
 	if err != nil {
 		panic("called MustLibp2pMultiaddrJoin with bad peer!")
 	}
-	return addr.Encapsulate(pidAddr)
+	return Multiaddr{Multiaddr: v.Encapsulate(pidAddr)}
 }
